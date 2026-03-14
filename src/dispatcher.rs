@@ -33,6 +33,7 @@ pub struct Task {
 
 pub struct AppState {
     pub queues: Mutex<HashMap<String, VecDeque<Task>>>,
+    pub processing_counts: Mutex<HashMap<String, usize>>,
     pub processed_counts: Mutex<HashMap<String, usize>>,
     pub dropped_counts: Mutex<HashMap<String, usize>>,
     pub user_ips: Mutex<HashMap<String, IpAddr>>,
@@ -48,6 +49,7 @@ impl AppState {
         let (blocked_ips, blocked_users) = Self::load_blocked_items();
         Self {
             queues: Mutex::new(HashMap::new()),
+            processing_counts: Mutex::new(HashMap::new()),
             processed_counts: Mutex::new(HashMap::new()),
             dropped_counts: Mutex::new(HashMap::new()),
             user_ips: Mutex::new(HashMap::new()),
@@ -164,12 +166,36 @@ pub async fn run_worker(state: Arc<AppState>) {
 
         match task_opt {
             Some((user_id, task)) => {
+                // Check if user or IP was blocked after the task was queued
+                let is_blocked = {
+                    let blocked_users = state.blocked_users.lock().unwrap();
+                    let blocked_ips = state.blocked_ips.lock().unwrap();
+                    let user_ips = state.user_ips.lock().unwrap();
+                    
+                    let user_blocked = blocked_users.contains(&user_id);
+                    let ip_blocked = user_ips.get(&user_id).map(|ip| blocked_ips.contains(ip)).unwrap_or(false);
+                    
+                    user_blocked || ip_blocked
+                };
+
+                if is_blocked {
+                    info!("Dropping queued task for blocked user/IP: {}", user_id);
+                    let mut dropped = state.dropped_counts.lock().unwrap();
+                    *dropped.entry(user_id).or_insert(0) += 1;
+                    continue;
+                }
+
                 // Check if client is still connected before processing
                 if task.responder.is_closed() {
                     info!("Skipping task for user {} - client disconnected", user_id);
                     let mut dropped = state.dropped_counts.lock().unwrap();
                     *dropped.entry(user_id).or_insert(0) += 1;
                     continue;
+                }
+
+                {
+                    let mut processing = state.processing_counts.lock().unwrap();
+                    *processing.entry(user_id.clone()).or_insert(0) += 1;
                 }
 
                 info!("Processing {} for user: {}", task.path, user_id);
@@ -217,25 +243,32 @@ pub async fn run_worker(state: Arc<AppState>) {
 
                                 if client_disconnected {
                                     let mut dropped = state.dropped_counts.lock().unwrap();
-                                    *dropped.entry(user_id).or_insert(0) += 1;
+                                    *dropped.entry(user_id.clone()).or_insert(0) += 1;
                                 } else {
                                     info!("Request {} for user {} completed", task.path, user_id);
                                     let mut counts = state.processed_counts.lock().unwrap();
-                                    *counts.entry(user_id).or_insert(0) += 1;
+                                    *counts.entry(user_id.clone()).or_insert(0) += 1;
                                 }
                             }
                             Err(e) => {
                                 info!("Request {} for user {} failed: {}", task.path, user_id, e);
                                 let _ = task.responder.send(Err(e)).await;
                                 let mut dropped = state.dropped_counts.lock().unwrap();
-                                *dropped.entry(user_id).or_insert(0) += 1;
+                                *dropped.entry(user_id.clone()).or_insert(0) += 1;
                             }
                         }
                     }
                     _ = task.responder.closed() => {
                         info!("Client disconnected while waiting for backend response for user {}", user_id);
                         let mut dropped = state.dropped_counts.lock().unwrap();
-                        *dropped.entry(user_id).or_insert(0) += 1;
+                        *dropped.entry(user_id.clone()).or_insert(0) += 1;
+                    }
+                }
+
+                {
+                    let mut processing = state.processing_counts.lock().unwrap();
+                    if let Some(count) = processing.get_mut(&user_id) {
+                        *count = count.saturating_sub(1);
                     }
                 }
             }

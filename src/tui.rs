@@ -159,6 +159,45 @@ impl TuiDashboard {
                                     }
                                 }
                             }
+                        } else if self.active_panel == Panel::Users {
+                            let selected = self.table_state.selected();
+                            if let Some(i) = selected {
+                                let queues = state.queues.lock().unwrap();
+                                let mut users: Vec<_> = queues.keys().cloned().collect();
+
+                                // Sorting logic must match render_users exactly
+                                let processing = state.processing_counts.lock().unwrap();
+                                let counts = state.processed_counts.lock().unwrap();
+                                let dropped_counts = state.dropped_counts.lock().unwrap();
+                                users.sort_by(|a, b| {
+                                    let a_q = queues.get(a).map(|q| q.len()).unwrap_or(0) + processing.get(a).cloned().unwrap_or(0);
+                                    let b_q = queues.get(b).map(|q| q.len()).unwrap_or(0) + processing.get(b).cloned().unwrap_or(0);
+                                    let a_p = counts.get(a).cloned().unwrap_or(0);
+                                    let b_p = counts.get(b).cloned().unwrap_or(0);
+                                    let a_d = dropped_counts.get(a).cloned().unwrap_or(0);
+                                    let b_d = dropped_counts.get(b).cloned().unwrap_or(0);
+
+                                    b_q.cmp(&a_q)
+                                        .then_with(|| (b_p + b_d).cmp(&(a_p + a_d)))
+                                        .then_with(|| a.cmp(b))
+                                });
+
+                                if i < users.len() {
+                                    let user_id = &users[i];
+                                    
+                                    // Unblock the user
+                                    state.unblock_user(user_id);
+                                    
+                                    // Also unblock their associated IP if we know it
+                                    let ip_opt = {
+                                        let ips = state.user_ips.lock().unwrap();
+                                        ips.get(user_id).cloned()
+                                    };
+                                    if let Some(ip) = ip_opt {
+                                        state.unblock_ip(ip);
+                                    }
+                                }
+                            }
                         }
                     }
                     KeyCode::Up | KeyCode::Char('k') => {
@@ -211,6 +250,36 @@ impl TuiDashboard {
     }
 
     fn render(&mut self, f: &mut Frame, state: &Arc<AppState>) {
+        // Ensure active selection if lists are not empty
+        {
+            let queues = state.queues.lock().unwrap();
+            let ips = state.blocked_ips.lock().unwrap();
+            let users = state.blocked_users.lock().unwrap();
+
+            if self.active_panel == Panel::Users {
+                if queues.is_empty() {
+                    self.table_state.select(None);
+                } else if self.table_state.selected().is_none() {
+                    self.table_state.select(Some(0));
+                } else if let Some(selected) = self.table_state.selected() {
+                    if selected >= queues.len() {
+                        self.table_state.select(Some(queues.len().saturating_sub(1)));
+                    }
+                }
+            } else {
+                let blocked_total = ips.len() + users.len();
+                if blocked_total == 0 {
+                    self.blocked_table_state.select(None);
+                } else if self.blocked_table_state.selected().is_none() {
+                    self.blocked_table_state.select(Some(0));
+                } else if let Some(selected) = self.blocked_table_state.selected() {
+                    if selected >= blocked_total {
+                        self.blocked_table_state.select(Some(blocked_total.saturating_sub(1)));
+                    }
+                }
+            }
+        }
+
         let area = f.area();
 
         // Vertical layout: Stats (top), Content (middle), Help (bottom)
@@ -271,12 +340,14 @@ impl TuiDashboard {
 
     fn render_stats(&self, state: &Arc<AppState>) -> Paragraph<'_> {
         let queues = state.queues.lock().unwrap();
+        let processing = state.processing_counts.lock().unwrap();
         let counts = state.processed_counts.lock().unwrap();
         let dropped = state.dropped_counts.lock().unwrap();
         let user_count = queues.len();
-        let total_queued: usize = queues.values().map(|q| q.len()).sum();
-        let total_processed: usize = counts.values().sum();
-        let total_dropped: usize = dropped.values().sum();
+        let total_queued: usize = queues.values().map(|q| q.len()).sum::<usize>();
+        let total_processing: usize = processing.values().sum::<usize>();
+        let total_processed: usize = counts.values().sum::<usize>();
+        let total_dropped: usize = dropped.values().sum::<usize>();
 
         let panel_name = match self.active_panel {
             Panel::Users => "USERS",
@@ -297,7 +368,7 @@ impl TuiDashboard {
             Span::raw(" | "),
             Span::styled("Queued: ", Style::default().fg(Color::Yellow)),
             Span::styled(
-                total_queued.to_string(),
+                (total_queued + total_processing).to_string(),
                 Style::default().fg(Color::Yellow).bold(),
             ),
             Span::raw(" | "),
@@ -319,6 +390,7 @@ impl TuiDashboard {
 
     fn render_users(&self, state: &Arc<AppState>) -> Table<'static> {
         let queues = state.queues.lock().unwrap();
+        let processing = state.processing_counts.lock().unwrap();
         let counts = state.processed_counts.lock().unwrap();
         let dropped_counts = state.dropped_counts.lock().unwrap();
         let user_ips = state.user_ips.lock().unwrap();
@@ -327,8 +399,8 @@ impl TuiDashboard {
 
         let mut users: Vec<_> = queues.keys().cloned().collect();
         users.sort_by(|a, b| {
-            let a_q = queues.get(a).map(|q| q.len()).unwrap_or(0);
-            let b_q = queues.get(b).map(|q| q.len()).unwrap_or(0);
+            let a_q = queues.get(a).map(|q| q.len()).unwrap_or(0) + processing.get(a).cloned().unwrap_or(0);
+            let b_q = queues.get(b).map(|q| q.len()).unwrap_or(0) + processing.get(b).cloned().unwrap_or(0);
             let a_p = counts.get(a).cloned().unwrap_or(0);
             let b_p = counts.get(b).cloned().unwrap_or(0);
             let a_d = dropped_counts.get(a).cloned().unwrap_or(0);
@@ -342,7 +414,9 @@ impl TuiDashboard {
         let rows: Vec<Row> = users
             .iter()
             .map(|user| {
-                let queue_len = queues.get(user).map(|q| q.len()).unwrap_or(0);
+                let queue_only = queues.get(user).map(|q| q.len()).unwrap_or(0);
+                let processing_count = processing.get(user).cloned().unwrap_or(0);
+                let queue_len = queue_only + processing_count;
                 let processed = counts.get(user).cloned().unwrap_or(0);
                 let dropped = dropped_counts.get(user).cloned().unwrap_or(0);
                 let ip_addr = user_ips.get(user);
@@ -354,7 +428,9 @@ impl TuiDashboard {
 
                 let (status_symbol, status_style) = if is_blocked {
                     ("✖ ", Style::default().fg(Color::Red))
-                } else if queue_len > 0 {
+                } else if processing_count > 0 {
+                    ("▶ ", Style::default().fg(Color::Cyan))
+                } else if queue_only > 0 {
                     ("● ", Style::default().fg(Color::Green))
                 } else {
                     ("○ ", Style::default().fg(Color::DarkGray))
@@ -364,6 +440,8 @@ impl TuiDashboard {
                     Style::default()
                         .fg(Color::Red)
                         .add_modifier(Modifier::CROSSED_OUT)
+                } else if processing_count > 0 {
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(Color::White)
                 };
@@ -387,7 +465,9 @@ impl TuiDashboard {
                         },
                     ])),
                     Cell::from(ip_str).style(ip_style),
-                    Cell::from(queue_len.to_string()).style(if queue_len > 0 {
+                    Cell::from(queue_len.to_string()).style(if processing_count > 0 {
+                        Style::default().fg(Color::Cyan).bold()
+                    } else if queue_only > 0 {
                         Style::default().fg(Color::Yellow)
                     } else {
                         Style::default().fg(Color::Gray)
@@ -436,8 +516,9 @@ impl TuiDashboard {
 
     fn render_queues(&self, state: &Arc<AppState>, available_width: u16) -> Table<'static> {
         let queues = state.queues.lock().unwrap();
+        let processing = state.processing_counts.lock().unwrap();
         let counts = state.processed_counts.lock().unwrap();
-        let total_queued: usize = queues.values().map(|q| q.len()).sum();
+        let total_queued: usize = queues.values().map(|q| q.len()).sum::<usize>() + processing.values().sum::<usize>();
 
         // Column widths for visualization
         let col_widths = [
@@ -452,8 +533,8 @@ impl TuiDashboard {
 
         let mut users: Vec<_> = queues.keys().cloned().collect();
         users.sort_by(|a, b| {
-            let a_q = queues.get(a).map(|q| q.len()).unwrap_or(0);
-            let b_q = queues.get(b).map(|q| q.len()).unwrap_or(0);
+            let a_q = queues.get(a).map(|q| q.len()).unwrap_or(0) + processing.get(a).cloned().unwrap_or(0);
+            let b_q = queues.get(b).map(|q| q.len()).unwrap_or(0) + processing.get(b).cloned().unwrap_or(0);
             let a_p = counts.get(a).cloned().unwrap_or(0);
             let b_p = counts.get(b).cloned().unwrap_or(0);
 
@@ -465,14 +546,17 @@ impl TuiDashboard {
         let rows: Vec<Row> = users
             .iter()
             .map(|user| {
-                let queue_len = queues.get(user).map(|q| q.len()).unwrap_or(0);
+                let queue_len = queues.get(user).map(|q| q.len()).unwrap_or(0) + processing.get(user).cloned().unwrap_or(0);
+                let is_processing = processing.get(user).cloned().unwrap_or(0) > 0;
 
                 // Calculate fill percentage relative to threshold
                 let fill_ratio = (queue_len as f32 / max_queue_threshold as f32).min(1.0);
                 let bar_len = (fill_ratio * bar_max_width as f32) as usize;
 
                 // Colors change based on column fill percentage - more sensitive thresholds
-                let bar_color = if fill_ratio >= 0.5 {
+                let bar_color = if is_processing {
+                    Color::Cyan
+                } else if fill_ratio >= 0.5 {
                     Color::LightRed
                 } else if fill_ratio >= 0.2 {
                     Color::Yellow
@@ -606,9 +690,9 @@ impl TuiDashboard {
   PANELS:  'Tab' or 'h' / 'l' (Switch between Active Users and Blocked Items)
   SCROLL:  'j' / 'Down' | 'k' / 'Up'
   BLOCK:   'b' (Block selected User ID) | 'B' (Block selected user's IP)
-  UNBLOCK: 'u' (Unblock selected item in Blocked panel)
+  UNBLOCK: 'u' (Unblock selected user/IP in any panel)
   
-  VISUALS: ✖ (Blocked) | ● (Active) | ○ (Idle)
+  VISUALS: ✖ (Blocked) | ▶ (Processing) | ● (Queued) | ○ (Idle)
            Crossed out text indicates a blocked entity.
 ";
         Paragraph::new(help_text)

@@ -10,6 +10,8 @@
 
 - **Per-User Queuing**: Each user (identified by the `X-User-ID` header) has their own FIFO queue.
 - **Fair-Share Round-Robin Scheduling**: A background worker rotates through active users, processing one request at a time from each to prevent any single user from monopolizing the backend.
+- **Active Request Tracking**: Real-time monitoring of currently processing requests (marked with `▶` in the TUI).
+- **Instant Blocking**: Drop all queued tasks immediately when a user or IP is blocked.
 - **Full Streaming Support**: Proxies streaming responses from Ollama in real-time, maintaining per-user ordering while delivering tokens as they are generated.
 - **Real-Time TUI Dashboard**: A built-in terminal interface powered by `ratatui` for monitoring queue depths, active users, and request throughput in real-time.
 - **OpenAI Compatibility**: Supports standard OpenAI-compatible endpoints, making it easy to use with existing tools and libraries.
@@ -132,9 +134,19 @@ curl -X POST http://localhost:11435/api/chat \
 
 The interactive TUI dashboard provides a live view of the dispatcher's state:
 
-- **`j` / `k`** or **Arrows**: Navigate the user list.
-- **`q`** or **Esc**: Exit the dashboard.
-- **`h`**: Toggle detailed help.
+- **`j` / `k`** or **Arrows**: Navigate the user/blocked list.
+- **`Tab`** or **`h` / `l`**: Switch between the Users and Blocked panels.
+- **`b`**: Block the selected User ID.
+- **`B`**: Block the selected user's IP address.
+- **`u`**: Unblock the selected user or IP (works in both panels).
+- **`q`** or **Esc**: Exit the dashboard and stop the application.
+- **`?`**: Toggle detailed help.
+
+**Visual Indicators:**
+- `▶` (Cyan): Request is currently being processed/streamed.
+- `●` (Green): User has requests waiting in the queue.
+- `○` (Gray): User is idle (no active or queued requests).
+- `✖` (Red): User or IP is blocked.
 
 ### Logging
 

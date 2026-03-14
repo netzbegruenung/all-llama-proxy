@@ -141,16 +141,12 @@ async fn tui_loop(tui_state: Arc<Mutex<TuiState>>, state: Arc<AppState>) {
             match dashboard.run(&state) {
                 Ok(continue_loop) => {
                     if !continue_loop {
-                        let mut tui_state = tui_state.lock().unwrap();
-                        tui_state.visible = false;
-                        tui_state.toggle_notify.notify_one();
+                        return;
                     }
                 }
                 Err(e) => {
                     eprintln!("TUI error: {}", e);
-                    let mut tui_state = tui_state.lock().unwrap();
-                    tui_state.visible = false;
-                    tui_state.toggle_notify.notify_one();
+                    return;
                 }
             }
         } else {
