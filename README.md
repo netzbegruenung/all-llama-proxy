@@ -275,6 +275,34 @@ docker run -d \
 4. The task is forwarded to the Ollama backend (`localhost:11434`).
 5. The response is streamed back to the client in real-time through an async channel, keeping the worker occupied until the generation is complete.
 
+## 📦 Publishing to Docker Hub
+
+To publish a new version of `ollamaMQ` to Docker Hub, follow these steps:
+
+1. **Update Version**: Update the version number in `Cargo.toml`.
+2. **Build and Tag**:
+
+   ```bash
+   # Build the image for the current version
+   docker build -t chlebon/ollamamq:v0.2.4 .
+   
+   # Tag it as latest
+   docker tag chlebon/ollamamq:v0.2.4 chlebon/ollamamq:latest
+   ```
+
+3. **Push to Hub**:
+
+   ```bash
+   # Log in to Docker Hub (if not already logged in)
+   docker login
+   
+   # Push the versioned tag
+   docker push chlebon/ollamamq:v0.2.4
+   
+   # Push the latest tag
+   docker push chlebon/ollamamq:latest
+   ```
+
 ## 🧪 Development
 
 ### Stress Testing
