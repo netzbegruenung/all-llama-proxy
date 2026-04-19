@@ -40,6 +40,7 @@ pub struct TuiDashboard {
     blocked_table_state: TableState,
     active_panel: Panel,
     show_help: bool,
+    show_models: bool,
 }
 
 impl TuiDashboard {
@@ -49,6 +50,7 @@ impl TuiDashboard {
             blocked_table_state: TableState::default(),
             active_panel: Panel::Users,
             show_help: false,
+            show_models: false,
         }
     }
 
@@ -117,6 +119,7 @@ impl TuiDashboard {
                             return Ok(false);
                         }
                         KeyCode::Char('?') => self.show_help = !self.show_help,
+                        KeyCode::Char('m') => self.show_models = !self.show_models,
                         KeyCode::Tab | KeyCode::Char('l') | KeyCode::Char('h') => {
                             self.active_panel = match self.active_panel {
                                 Panel::Users => Panel::Blocked,
@@ -353,9 +356,9 @@ impl TuiDashboard {
     }
 
     fn render_backends(&self, snapshot: &StateSnapshot) -> Table<'static> {
-        let rows: Vec<Row> = snapshot.backends.iter().map(|b| {
+        let rows: Vec<Row> = snapshot.backends.iter().flat_map(|b| {
             let url = b.url.replace("http://", "").replace("https://", "");
-            
+
             let (status_sym, status_style) = if b.is_online {
                 ("● ", Style::default().fg(Color::Green))
             } else {
@@ -368,14 +371,38 @@ impl TuiDashboard {
                 Style::default().fg(Color::Gray)
             };
 
-            Row::new(vec![
+            let header_row = Row::new(vec![
                 Cell::from(Line::from(vec![
                     Span::styled(status_sym, status_style),
                     Span::styled(url, if b.is_online { Style::default().fg(Color::White) } else { Style::default().fg(Color::DarkGray).add_modifier(Modifier::CROSSED_OUT) }),
                 ])),
                 Cell::from(b.active_requests.to_string()).style(req_style),
                 Cell::from(b.processed_count.to_string()).style(Style::default().fg(Color::DarkGray)),
-            ])
+            ]);
+
+            let mut rows = vec![header_row];
+
+            if self.show_models {
+                let mut models: Vec<String> = b.available_models.iter().cloned().collect();
+                models.sort();
+                if models.is_empty() {
+                    rows.push(Row::new(vec![
+                        Cell::from("  (no models)").style(Style::default().fg(Color::DarkGray)),
+                        Cell::from(""),
+                        Cell::from(""),
+                    ]));
+                } else {
+                    for model in models {
+                        rows.push(Row::new(vec![
+                            Cell::from(format!("  {}", model)).style(Style::default().fg(Color::Blue)),
+                            Cell::from(""),
+                            Cell::from(""),
+                        ]));
+                    }
+                }
+            }
+
+            rows
         }).collect();
 
         Table::new(rows, [
@@ -455,11 +482,11 @@ impl TuiDashboard {
     }
 
     fn render_help(&self) -> Paragraph<'static> {
-        Paragraph::new(" Tab: Switch | p: VIP | b: Boost | x: Block User | X: Block IP | u: Unblock | q: Quit")
+        Paragraph::new(" Tab: Switch | p: VIP | b: Boost | x: Block User | X: Block IP | u: Unblock | m: Models | q: Quit")
             .block(Block::default().borders(Borders::ALL).title_bottom(Line::from(format!(" v{} ", env!("CARGO_PKG_VERSION"))).alignment(Alignment::Right)))
     }
 
     fn render_detailed_help(&self) -> Paragraph<'static> {
-        Paragraph::new("\n  VIP: 'p' | BOOST: 'b' | BLOCK: 'x' (User) / 'X' (IP) | UNBLOCK: 'u'\n  PANELS: 'Tab' | QUIT: 'q' or 'Esc'\n\n  ★ VIP | ⚡ Boost | ✖ Blocked | ▶ Processing | ● Queued").block(Block::default().title(" Help ").borders(Borders::ALL)).style(Style::default().fg(Color::Gray))
+        Paragraph::new("\n  VIP: 'p' | BOOST: 'b' | BLOCK: 'x' (User) / 'X' (IP) | UNBLOCK: 'u'\n  PANELS: 'Tab' | MODELS: 'm' | QUIT: 'q' or 'Esc'\n\n  ★ VIP | ⚡ Boost | ✖ Blocked | ▶ Processing | ● Queued").block(Block::default().title(" Help ").borders(Borders::ALL)).style(Style::default().fg(Color::Gray))
     }
 }

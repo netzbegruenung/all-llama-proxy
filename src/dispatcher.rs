@@ -26,10 +26,23 @@ struct BlockedConfig {
     users: HashSet<String>,
 }
 
+/// Parsed response from `/api/tags`
+#[derive(Deserialize)]
+struct ModelsResponse {
+    models: Vec<ModelInfo>,
+}
+
+#[derive(Deserialize)]
+struct ModelInfo {
+    name: String,
+}
+
 pub enum ResponsePart {
     Status(StatusCode, HeaderMap),
     Chunk(Bytes),
     Error(reqwest::Error),
+    #[allow(dead_code)]
+    ModelNotFound(String),
 }
 
 pub struct Task {
@@ -46,6 +59,7 @@ pub struct BackendStatus {
     pub active_requests: usize,
     pub processed_count: usize,
     pub is_online: bool,
+    pub available_models: HashSet<String>,
 }
 
 pub struct AppState {
@@ -78,6 +92,7 @@ impl AppState {
                 active_requests: 0,
                 processed_count: 0,
                 is_online: true, // Default to true until first check
+                available_models: HashSet::new(),
             })
             .collect();
 
@@ -167,6 +182,43 @@ impl AppState {
     }
 }
 
+/// Paths that carry a `model` field in their JSON body.
+const MODEL_PATHS: &[&str] = &[
+    "/api/generate",
+    "/api/chat",
+    "/api/embed",
+    "/api/embeddings",
+    "/v1/chat/completions",
+    "/v1/completions",
+    "/v1/embeddings",
+];
+
+/// Extract the `model` field from the request body when the path is model-aware.
+/// Returns `None` for non-model endpoints or when the field is absent.
+fn extract_model_name(body: &Bytes, path: &str) -> Option<String> {
+    if !MODEL_PATHS.iter().any(|p| path.starts_with(p)) {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_slice(body).ok()?;
+    v.get("model")?.as_str().map(|s| normalize_model_tag(s))
+}
+
+/// Append `:latest` if the model name has no explicit tag.
+fn normalize_model_tag(name: &str) -> String {
+    if name.contains(':') {
+        name.to_string()
+    } else {
+        format!("{}:latest", name)
+    }
+}
+
+/// True if `available` contains the requested model.
+/// Both sides are normalized to `name:tag` before comparison.
+fn backend_has_model(available: &HashSet<String>, requested: &str) -> bool {
+    let norm = normalize_model_tag(requested);
+    available.iter().any(|m| normalize_model_tag(m) == norm)
+}
+
 pub async fn run_worker(state: Arc<AppState>) {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(state.timeout))
@@ -186,25 +238,49 @@ pub async fn run_worker(state: Arc<AppState>) {
 
             for (idx, url) in backends_to_check {
                 let check_url = format!("{}/api/tags", url);
-                let is_online = health_client.get(&check_url).send().await.is_ok();
-                
-                let mut backends = health_state.backends.lock().unwrap();
-                if backends[idx].is_online != is_online {
-                    info!("Backend {} status changed to: {}", url, if is_online { "ONLINE" } else { "OFFLINE" });
-                    backends[idx].is_online = is_online;
+                match health_client.get(&check_url).send().await {
+                    Ok(resp) => {
+                        // Parse available models from the response body.
+                        let models: HashSet<String> = resp
+                            .json::<ModelsResponse>()
+                            .await
+                            .map(|mr| mr.models.into_iter().map(|m| m.name).collect())
+                            .unwrap_or_default();
+
+                        let mut backends = health_state.backends.lock().unwrap();
+                        if !backends[idx].is_online {
+                            info!("Backend {} status changed to: ONLINE", url);
+                            backends[idx].is_online = true;
+                        }
+                        backends[idx].available_models = models;
+                    }
+                    Err(_) => {
+                        let mut backends = health_state.backends.lock().unwrap();
+                        if backends[idx].is_online {
+                            info!("Backend {} status changed to: OFFLINE", url);
+                            backends[idx].is_online = false;
+                        }
+                        backends[idx].available_models.clear();
+                    }
                 }
             }
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
         }
     });
 
+    enum SelectionResult {
+        Dispatch(String, Task, usize, String),
+        ModelNotFound(Task, String),
+        Wait,
+    }
+
     loop {
-        let selection_opt = {
+        let selection = {
             let mut queues = state.queues.lock().unwrap();
             let mut backends = state.backends.lock().unwrap();
             let mut last_idx = state.last_backend_idx.lock().unwrap();
             
-            // 1. Find an available online backend (Limit: 1 request per backend)
+            // 1. Find all available online backends (Limit: 1 request per backend)
             let online_indices: Vec<usize> = backends.iter()
                 .enumerate()
                 .filter(|(_, b)| b.is_online && b.active_requests < 1)
@@ -212,7 +288,7 @@ pub async fn run_worker(state: Arc<AppState>) {
                 .collect();
 
             if online_indices.is_empty() {
-                None
+                SelectionResult::Wait
             } else {
                 let mut target_user = None;
                 let vip = state.vip_user.lock().unwrap().clone();
@@ -225,7 +301,7 @@ pub async fn run_worker(state: Arc<AppState>) {
                     .collect();
 
                 if active_users.is_empty() {
-                    None
+                    SelectionResult::Wait
                 } else {
                     active_users.sort_by(|a, b| {
                         let a_total = state.processed_counts.lock().unwrap().get(a).cloned().unwrap_or(0);
@@ -249,26 +325,54 @@ pub async fn run_worker(state: Arc<AppState>) {
                         Some(user_id) => {
                             let task = queues.get_mut(&user_id).unwrap().pop_front().unwrap();
                             *counter += 1;
-                            
-                            // Round-Robin among eligible backends with min connections
-                            let min_conns = online_indices.iter().map(|&i| backends[i].active_requests).min().unwrap();
-                            let candidates: Vec<usize> = online_indices.iter().cloned().filter(|&i| backends[i].active_requests == min_conns).collect();
-                            let candidate_pos = candidates.iter().position(|&i| i > *last_idx).unwrap_or(0);
-                            let selected_backend_idx = candidates[candidate_pos];
-                            
-                            *last_idx = selected_backend_idx;
-                            backends[selected_backend_idx].active_requests += 1;
-                            
-                            Some((user_id, task, selected_backend_idx, backends[selected_backend_idx].url.clone()))
+
+                            // Filter backends by model availability.
+                            let model_opt = extract_model_name(&task.body, &task.path);
+                            let eligible: Vec<usize> = if let Some(ref model) = model_opt {
+                                online_indices.iter().cloned()
+                                    .filter(|&i| backend_has_model(&backends[i].available_models, model))
+                                    .collect()
+                            } else {
+                                online_indices.clone()
+                            };
+
+                            if eligible.is_empty() {
+                                let model_name = model_opt.unwrap_or_default();
+                                SelectionResult::ModelNotFound(task, model_name)
+                            } else {
+                                // Round-Robin among eligible backends with min connections
+                                let min_conns = eligible.iter().map(|&i| backends[i].active_requests).min().unwrap();
+                                let candidates: Vec<usize> = eligible.iter().cloned().filter(|&i| backends[i].active_requests == min_conns).collect();
+                                let candidate_pos = candidates.iter().position(|&i| i > *last_idx).unwrap_or(0);
+                                let selected_backend_idx = candidates[candidate_pos];
+
+                                *last_idx = selected_backend_idx;
+                                backends[selected_backend_idx].active_requests += 1;
+
+                                SelectionResult::Dispatch(user_id, task, selected_backend_idx, backends[selected_backend_idx].url.clone())
+                            }
                         }
-                        None => None
+                        None => SelectionResult::Wait,
                     }
                 }
             }
         };
 
-        match selection_opt {
-            Some((user_id, task, backend_idx, backend_url)) => {
+        match selection {
+            SelectionResult::ModelNotFound(task, model_name) => {
+                warn!("No backend has model '{}', returning 503", model_name);
+                let error_body = Bytes::from(
+                    serde_json::json!({"error": format!("Model '{}' not available on any backend", model_name)}).to_string()
+                );
+                let mut headers = HeaderMap::new();
+                headers.insert(
+                    axum::http::header::CONTENT_TYPE,
+                    axum::http::HeaderValue::from_static("application/json"),
+                );
+                let _ = task.responder.send(ResponsePart::Status(StatusCode::SERVICE_UNAVAILABLE, headers)).await;
+                let _ = task.responder.send(ResponsePart::Chunk(error_body)).await;
+            }
+            SelectionResult::Dispatch(user_id, task, backend_idx, backend_url) => {
                 let state_clone = state.clone();
                 let client_clone = client.clone();
                 let url = format!("{}{}", backend_url, task.path);
@@ -347,7 +451,7 @@ pub async fn run_worker(state: Arc<AppState>) {
                     state_clone.backend_freed.notify_one();
                 });
             }
-            None => {
+            SelectionResult::Wait => {
                 tokio::select! {
                     _ = state.notify.notified() => {},
                     _ = state.backend_freed.notified() => {},
@@ -437,7 +541,7 @@ pub async fn proxy_handler(
                 match part {
                     ResponsePart::Chunk(chunk) => Ok(chunk),
                     ResponsePart::Error(e) => Err(e),
-                    _ => Ok(Bytes::new()),
+                    ResponsePart::ModelNotFound(_) | ResponsePart::Status(_, _) => Ok(Bytes::new()),
                 }
             });
 
