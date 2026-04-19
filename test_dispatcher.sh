@@ -19,11 +19,20 @@ USERS=(
     "tessa" "ulysses" "vera" "william" "yasmin"
 )
 
-echo "🚀 Starting 50-User Stress Test for ollamaMQ..."
+echo "🚀 Starting 50-User Stress Test for all-llama-proxy..."
 echo "Target Base: $BASE_URL"
 echo "Endpoints: ${ENDPOINTS[*]}"
 echo "Total Potential Users: ${#USERS[@]}"
 echo "----------------------------------------"
+
+seed_users() {
+  rm ./examples/users-test.yaml
+  for user in "${USERS[@]}"; do
+    TOKEN=$(echo -n "changeme-$user" | sha256sum)
+    echo """  - user_token: $TOKEN
+    user_id: $user""" >> ./examples/users-test.yaml
+  done
+}
 
 # Function to send a request
 send_request() {
@@ -65,6 +74,7 @@ send_and_cancel() {
     # Start curl in background, wait a tiny bit, then kill it
     curl -s -X POST "$url" \
         -H "X-User-ID: $user" \
+        -H "Authorization: Bearer changeme-$user"
         -H "Content-Type: application/json" \
         -d "{\"model\": \"${MODEL}\", \"prompt\": \"Canceled request $id\"}" > /dev/null &
     
