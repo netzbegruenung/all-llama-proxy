@@ -56,7 +56,7 @@ Go to the [releases section](https://github.com/netzbegruenung/all-llama-proxy/r
 
 - `--models-config-path`: path to the model configuration file (default: `/etc/all-llama-proxy/models.yaml`)
 - `--users-path`: path to the users config file (default: `/etc/all-llama-proxy/users.yaml`)
-- `-p, --port <PORT>`: Port to listen on (default: `11435`)
+- `--bind <INTERFACE:PORT>`: Interface and port to listen on (default: `127.0.0.1:11435`)
 - `-t, --timeout <SECONDS>`: Request timeout in seconds (default: `300`)
 - `--tui`: Use the interactive TUI dashboard
 - `--allow-all-routes`: Enable fallback proxy for non-standard endpoints

@@ -22,9 +22,9 @@ use crate::dispatcher::{AppState, LogBuffer, LogBufferWriter, proxy_handler, tag
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Port to listen on
-    #[arg(short, long, default_value_t = 11435)]
-    port: u16,
+    /// Address to bind to (e.g., 127.0.0.1:11435, 0.0.0.0:8080, or [::1]:11435)
+    #[arg(short, long, default_value = "127.0.0.1:11435")]
+    bind: String,
 
     /// Request timeout in seconds
     #[arg(short, long, default_value_t = 300)]
