@@ -29,10 +29,14 @@ struct StateSnapshot {
     user_ips: HashMap<String, IpAddr>,
     blocked_ips: HashSet<IpAddr>,
     blocked_users: HashSet<String>,
-    vip_user: Option<String>,
+    vip_list: Vec<String>,
     boost_user: Option<String>,
     user_ids: Vec<String>,
     backends: Vec<BackendStatus>,
+    /// Maps real model name -> public display name
+    model_public_names: HashMap<String, String>,
+    /// Last 4 log lines (level, message)
+    log_lines: Vec<(String, String)>,
 }
 
 pub struct TuiDashboard {
@@ -65,9 +69,21 @@ impl TuiDashboard {
         let user_ips = state.user_ips.lock().unwrap().clone();
         let blocked_ips = state.blocked_ips.lock().unwrap().clone();
         let blocked_users = state.blocked_users.lock().unwrap().clone();
-        let vip_user = state.vip_user.lock().unwrap().clone();
+        let vip_list = state.vip_user.lock().unwrap().clone();
         let boost_user = state.boost_user.lock().unwrap().clone();
         let backends = state.backends.lock().unwrap().clone();
+
+        // Build real_name -> public_name map from model config
+        let model_public_names: HashMap<String, String> = {
+            let config = state.model_config.read().unwrap();
+            config.models.iter().map(|m| {
+                let display = m.public_name.clone().unwrap_or_else(|| m.name.clone());
+                (m.name.clone(), display)
+            }).collect()
+        };
+
+        // Get last 4 log lines from buffer
+        let log_lines = state.log_buffer.get_last_n(4);
 
         let mut user_ids: Vec<String> = queues_len.keys().cloned().collect();
         user_ids.sort_by(|a, b| {
@@ -89,10 +105,12 @@ impl TuiDashboard {
             user_ips,
             blocked_ips,
             blocked_users,
-            vip_user,
+            vip_list,
             boost_user,
             user_ids,
             backends,
+            model_public_names,
+            log_lines,
         }
     }
 
@@ -132,17 +150,15 @@ impl TuiDashboard {
                                     if i < snapshot.user_ids.len() {
                                         let user_id = snapshot.user_ids[i].clone();
                                         
-                                        // 1. Handle VIP
-                                        {
-                                            let mut vip = state.vip_user.lock().unwrap();
-                                            if vip.as_ref() == Some(&user_id) {
-                                                *vip = None;
-                                            } else {
-                                                *vip = Some(user_id.clone());
-                                            }
+                                        // Toggle VIP: add if not in list, remove if already VIP
+                                        let mut vip_list = state.vip_user.lock().unwrap();
+                                        if vip_list.contains(&user_id) {
+                                            vip_list.retain(|u| u != &user_id);
+                                        } else {
+                                            vip_list.push(user_id.clone());
                                         }
                                         
-                                        // 2. Clear Boost if we just set VIP
+                                        // Clear Boost if just set VIP
                                         {
                                             let mut boost = state.boost_user.lock().unwrap();
                                             if boost.as_ref() == Some(&user_id) {
@@ -159,7 +175,7 @@ impl TuiDashboard {
                                     if i < snapshot.user_ids.len() {
                                         let user_id = snapshot.user_ids[i].clone();
                                         
-                                        // 1. Handle Boost
+                                        // 1. Handle Boost: toggle on/off
                                         {
                                             let mut boost = state.boost_user.lock().unwrap();
                                             if boost.as_ref() == Some(&user_id) {
@@ -169,12 +185,10 @@ impl TuiDashboard {
                                             }
                                         }
                                         
-                                        // 2. Clear VIP if we just set Boost
+                                        // 2. Clear VIP if user is currently VIP
                                         {
                                             let mut vip = state.vip_user.lock().unwrap();
-                                            if vip.as_ref() == Some(&user_id) {
-                                                *vip = None;
-                                            }
+                                            vip.retain(|u| u != &user_id);
                                         }
                                     }
                                 }
@@ -289,9 +303,10 @@ impl TuiDashboard {
         let main_chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(3), // Stats
-                Constraint::Min(0),    // Content
-                Constraint::Length(3), // Help bar
+                Constraint::Length(3),        // Stats
+                Constraint::Min(4),           // Content (reduced by 4 rows for logs)
+                Constraint::Length(4),        // Log messages
+                Constraint::Length(3),        // Help bar
                 if self.show_help { Constraint::Length(12) } else { Constraint::Length(0) },
             ])
             .split(area);
@@ -318,9 +333,11 @@ impl TuiDashboard {
         f.render_stateful_widget(self.render_queues(snapshot, right_chunks[0].width), right_chunks[0], &mut self.table_state);
         f.render_stateful_widget(self.render_blocked(snapshot), right_chunks[1], &mut self.blocked_table_state);
 
-        f.render_widget(self.render_help(), main_chunks[2]);
+        // Render log messages
+        f.render_widget(self.render_logs(snapshot), main_chunks[2]);
+        f.render_widget(self.render_help(), main_chunks[3]);
         if self.show_help {
-            f.render_widget(self.render_detailed_help(), main_chunks[3]);
+            f.render_widget(self.render_detailed_help(), main_chunks[4]);
         }
     }
 
@@ -335,9 +352,6 @@ impl TuiDashboard {
             Span::raw(" | "),
             Span::styled("Panel: ", Style::default().fg(Color::White)),
             Span::styled(if self.active_panel == Panel::Users { "USERS" } else { "BLOCKED" }, Style::default().fg(Color::Yellow).bold()),
-            Span::raw(" | "),
-            Span::styled("VIP: ", Style::default().fg(Color::Magenta)),
-            Span::styled(snapshot.vip_user.clone().unwrap_or_else(|| "None".to_string()), Style::default().fg(Color::Magenta).bold()),
             Span::raw(" | "),
             Span::styled("Boost: ", Style::default().fg(Color::Yellow)),
             Span::styled(snapshot.boost_user.clone().unwrap_or_else(|| "None".to_string()), Style::default().fg(Color::Yellow).bold()),
@@ -383,18 +397,35 @@ impl TuiDashboard {
             let mut rows = vec![header_row];
 
             if self.show_models {
-                let mut models: Vec<String> = b.available_models.iter().cloned().collect();
-                models.sort();
-                if models.is_empty() {
+                if b.configured_models.is_empty() {
                     rows.push(Row::new(vec![
                         Cell::from("  (no models)").style(Style::default().fg(Color::DarkGray)),
                         Cell::from(""),
                         Cell::from(""),
                     ]));
                 } else {
-                    for model in models {
+                    for model in &b.configured_models {
+                        // Check per-model status
+                        let available = b.model_status
+                            .read()
+                            .unwrap()
+                            .get(model)
+                            .copied()
+                            .unwrap_or(true);
+                        
+                        let (sym, style) = if available {
+                            ("✓", Style::default().fg(Color::Green))
+                        } else {
+                            ("✗", Style::default().fg(Color::Red))
+                        };
+                        
+                        let display_name = snapshot.model_public_names
+                            .get(model)
+                            .cloned()
+                            .unwrap_or_else(|| model.clone());
+                        
                         rows.push(Row::new(vec![
-                            Cell::from(format!("  {}", model)).style(Style::default().fg(Color::Blue)),
+                            Cell::from(format!("  {} {}", sym, display_name)).style(style),
                             Cell::from(""),
                             Cell::from(""),
                         ]));
@@ -421,7 +452,7 @@ impl TuiDashboard {
             let dropped = snapshot.dropped_counts.get(user).unwrap_or(&0);
             let ip_str = snapshot.user_ips.get(user).map(|i| i.to_string()).unwrap_or_default();
             let is_blocked = snapshot.blocked_users.contains(user) || snapshot.user_ips.get(user).map_or(false, |ip| snapshot.blocked_ips.contains(ip));
-            let is_vip = snapshot.vip_user.as_ref() == Some(user);
+            let is_vip = snapshot.vip_list.contains(user);
             let is_boost = snapshot.boost_user.as_ref() == Some(user);
 
             let (sym, style) = if is_blocked { ("✖ ", Style::default().fg(Color::Red)) }
@@ -453,7 +484,7 @@ impl TuiDashboard {
         let rows: Vec<Row> = snapshot.user_ids.iter().map(|user| {
             let q_len = snapshot.queues_len.get(user).unwrap_or(&0) + snapshot.processing_counts.get(user).unwrap_or(&0);
             let bar_len = if q_len > 0 { ((q_len as f32 / 20.0).min(1.0) * bar_max_width as f32) as usize } else { 0 };
-            let color = if snapshot.vip_user.as_ref() == Some(user) { Color::Magenta } else if snapshot.boost_user.as_ref() == Some(user) { Color::Yellow } else if *snapshot.processing_counts.get(user).unwrap_or(&0) > 0 { Color::Cyan } else { Color::Green };
+            let color = if snapshot.vip_list.contains(user) { Color::Magenta } else if snapshot.boost_user.as_ref() == Some(user) { Color::Yellow } else if *snapshot.processing_counts.get(user).unwrap_or(&0) > 0 { Color::Cyan } else { Color::Green };
             let bar = format!("{:<width$}", "⠿".repeat(bar_len), width = bar_max_width);
             let pct = if total_queued > 0 { (q_len as f64 / total_queued as f64) * 100.0 } else { 0.0 };
             Row::new(vec![Cell::from(user.clone()), Cell::from(bar).style(Style::default().fg(color)), Cell::from(format!("{} ({:.0}%)", q_len, pct)).style(Style::default().fg(color).bold())])
@@ -479,6 +510,27 @@ impl TuiDashboard {
             .row_highlight_style(Style::default().bg(Color::Rgb(40, 40, 40)).add_modifier(Modifier::BOLD))
             .highlight_symbol(">> ")
             .block(Block::default().title(" Blocked Items ").borders(Borders::ALL).border_style(if self.active_panel == Panel::Blocked { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::DarkGray) }))
+    }
+
+    fn render_logs(&self, snapshot: &StateSnapshot) -> Paragraph<'static> {
+        let logs: Vec<Line> = snapshot.log_lines.iter().map(|(level, msg)| {
+            let color = match level.as_str() {
+                "DEBUG" => Color::Blue,
+                "INFO"  => Color::White,
+                "WARN"  => Color::Yellow,
+                "ERROR" => Color::Red,
+                _       => Color::Gray,
+            };
+            
+            Line::from(vec![
+                Span::styled(format!("{:<5} ", level), Style::default().fg(color).bold()),
+                Span::styled(msg.clone(), Style::default().fg(color)),
+            ])
+        }).collect();
+        
+        Paragraph::new(logs)
+            .block(Block::default().title(" Log Messages ").borders(Borders::ALL))
+            .style(Style::default().fg(Color::Gray))
     }
 
     fn render_help(&self) -> Paragraph<'static> {

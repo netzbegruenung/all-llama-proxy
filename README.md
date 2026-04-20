@@ -1,6 +1,8 @@
-# ollamaMQ
+# all-llama-proxy
 
-`ollamaMQ` is a high-performance, asynchronous message queue dispatcher and load balancer designed to sit in front of one or more [Ollama](https://ollama.ai/) API instances. It acts as a smart proxy that queues incoming requests from multiple users and dispatches them in parallel to multiple Ollama backends using a fair-share round-robin scheduler with least-connections load balancing.
+`all-lama-proxy` is a high-performance, asynchronous message queue dispatcher and load balancer designed to sit in front of one or more [Ollama](https://ollama.ai/) API instances. It acts as a smart proxy that queues incoming requests from multiple users and dispatches them in parallel to multiple Ollama backends using a fair-share round-robin scheduler with least-connections load balancing.
+
+`all-lama-proxy` is a fork of the awesome [`all-llama-proxy](https://github.com/Chleba/all-llama-proxy)` project. This project adds authentication and replaces Docker with a systemd systemd as the intended deployment method.
 
 ![Rust](https://img.shields.io/badge/rust-2024-orange.svg)
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
@@ -9,35 +11,29 @@
 ## 🚀 Features
 
 - **Multi-Backend Load Balancing**: Distribute requests across multiple Ollama instances using a **Least Connections + Round Robin** strategy.
-- **Parallel Processing**: Unlike basic proxies, `ollamaMQ` can process multiple requests simultaneously (one per available backend), significantly increasing throughput for multiple users.
+- **Parallel Processing**: Unlike basic proxies, `all-llama-proxy` can process multiple requests simultaneously (one per available backend), significantly increasing throughput for multiple users.
 - **Backend Health Checks**: Automatically monitors backend status every 10 seconds; offline instances are temporarily skipped and marked in the TUI.
+- **Config Reload**: reload the config with a SIGHUP signal without restarting the service.
+- **Authentication**: A simple user database that allows adding SHA256 sums of access tokens.
 - **Per-User Queuing**: Each user (identified by the `X-User-ID` header) has their own FIFO queue.
 - **Fair-Share Scheduling**: Prevents any single user from monopolizing all available backends.
 - **Transparent Header Forwarding**: Full support for all HTTP headers (including `X-User-ID`) passed to and from Ollama, ensuring compatibility with tools like **Claude Code**.
-- **VIP & Boost Modes**: Absolute priority (VIP) or increased frequency (Boost) for specific users.
+- **VIP & Boost Modes**: High priority (VIP) or increased frequency (Boost) for specific users.
 - **Real-Time TUI Dashboard**: Monitor backend health, active requests, queue depths, and throughput in real-time.
 - **OpenAI Compatibility**: Supports standard OpenAI-compatible endpoints.
 - **Async Architecture**: Built on `tokio` and `axum` for high concurrency.
-
-![ollamaMQ TUI Dashboard](demo.gif)
 
 ## 🛠️ Installation
 
 Ensure you have [Rust](https://rustup.rs/) (2024 edition or later) and [Ollama](https://ollama.ai/) installed.
 
-### Option 1: Install via Cargo (Recommended)
-
-```bash
-cargo install ollamaMQ
-```
-
-### Option 2: From Source
+### Install from Source
 
 1. Clone the repository:
 
    ```bash
-   git clone https://github.com/Chleba/ollamaMQ.git
-   cd ollamaMQ
+   git clone https://github.com/Chleba/all-llama-proxy.git
+   cd all-llama-proxy
    ```
 
 2. Build and install locally:
@@ -47,65 +43,48 @@ cargo install ollamaMQ
 
 ## 🏃 Usage
 
-### Docker Installation
-
-#### Using Docker Compose (Recommended)
-
-1. Ensure Docker and Docker Compose are installed.
-2. Start your local Ollama instance (defaulting to `localhost:11434`).
-3. Run:
-   ```bash
-   docker compose up -d
-   ```
-
-#### Using Docker CLI
-
-First build the image from the local Dockerfile:
-
-```bash
-docker build -t chlebon/ollamamq .
-```
-
-Then run the container:
-
-```bash
-docker run -d \
-  --name ollamamq \
-  -p 11435:11435 \
-  --restart unless-stopped \
-  chlebon/ollamamq
-```
-
 ### Command Line Arguments
 
-`ollamaMQ` supports several options to configure the proxy:
+`all-llama-proxy` supports several options to configure the proxy:
 
+- `--models-config-path`: path to the model configuration file (default: `/etc/all-llama-proxy/models.yaml`)
+- `--users-path`: path to the users config file (default: `/etc/all-llama-proxy/users.yaml`)
 - `-p, --port <PORT>`: Port to listen on (default: `11435`)
-- `-o, --ollama-urls <URL1,URL2>`: Comma-separated list of Ollama server URLs (default: `http://localhost:11434`)
 - `-t, --timeout <SECONDS>`: Request timeout in seconds (default: `300`)
-- `--no-tui`: Disable the interactive TUI dashboard (useful for Docker/CI)
+- `--tui`: Use the interactive TUI dashboard
 - `--allow-all-routes`: Enable fallback proxy for non-standard endpoints
 - `-h, --help`: Print help message
 - `-V, --version`: Print version information
+- `--debug`: print debug messages to log file
+- `-i, --ip-header`: trusted source IP header, useful behind proxy for TLS offloading
 
 **Example:**
 
 ```bash
-ollamaMQ --port 8080 --ollama-urls http://10.0.0.1:11434,http://10.0.0.2:11434 --timeout 600
+all-llama-proxy --port 8080 --models-config-path ./example/models.yaml --users-path ./texample/users.yaml
 ```
 
-**Docker Example:**
+### Add new User to `users.yaml`
 
-```bash
-docker run -d \
-  --name ollamamq \
-  -p 8080:8080 \
-  chlebon/ollamamq --port 8080 --ollama-urls http://192.168.1.5:11434 --timeout 600
-```
+1. First generate a seecret token (with your password manager)
+
+1. Create a SHA256 hash of the token:
+
+   ```bash
+   echo -n "SECRET_TOKEN" | sha256sum
+   ```
+
+1. Add a new entry to the users.yaml:
+
+   ```yaml
+   users:
+   - token_hash: REPLACE_WITH_HASH
+     user_id: REPLACE_WITH_USER_ID
+   ```
 
 ### API Proxying
 
-Point your LLM clients to the `ollamaMQ` port (`11435`) and include the `X-User-ID` header.
+Point your LLM clients to the `all-llama-proxy` port (`11435`) and include the `X-User-ID` header.
 
 #### Supported Endpoints:
 
@@ -150,7 +129,7 @@ The interactive TUI dashboard provides a live view of the dispatcher's state:
 
 - **`j` / `k`** or **Arrows**: Navigate the user/blocked list.
 - **`Tab`** or **`h` / `l`**: Switch between the Users and Blocked panels.
-- **`p`**: Toggle **VIP** status for the selected user (absolute priority).
+- **`p`**: Toggle **VIP** status for the selected user (priority over non-VIP users).
 - **`b`**: Toggle **Boost** status for the selected user (prioritizes every 5th request).
 - **`x`**: Block the selected user.
 - **`X`**: Block the selected user's IP address.
@@ -159,162 +138,34 @@ The interactive TUI dashboard provides a live view of the dispatcher's state:
 - **`?`**: Toggle detailed help.
 
 **Visual Indicators:**
-- `★` (Magenta): **VIP User** (absolute priority).
+- `★` (Magenta): **VIP User** (priority).
 - `⚡` (Yellow): **Boosted User** (every 5th request priority).
 - `▶` (Cyan): Request is currently being processed/streamed.
 - `●` (Green): User has requests waiting in the queue.
 - `○` (Gray): User is idle (no active or queued requests).
 - `✖` (Red): User or IP is blocked.
 
-### Logging
-
-Logs are automatically written to `ollamamq.log` in the current working directory. This keeps the terminal clear for the TUI dashboard while allowing you to monitor system events and debug backend communication.
-
-## 🐳 Docker
-
-### Docker Compose
-
-The included `docker-compose.yml` provides a ready-to-use configuration:
-
-```yaml
-services:
-  ollamamq:
-    build: .
-    image: chlebon/ollamamq:latest
-    container_name: ollamamq
-    ports:
-      - "11435:11435"
-    environment:
-      - OLLAMA_URLS=http://host.docker.internal:11434
-      - PORT=11435
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    restart: unless-stopped
-```
-
-**Note for Linux Users:**
-When running in Docker on Linux to access a host-based Ollama:
-
-1.  **Listen on all interfaces:** Ollama must be configured to listen on `0.0.0.0`. You can do this by setting `export OLLAMA_HOST=0.0.0.0` before starting the Ollama service (or editing the systemd unit file).
-2.  **Firewall:** Ensure your firewall (e.g., `ufw`) allows traffic from the Docker bridge (usually `172.17.0.1/16`) to port `11434`.
-3.  **Host Gateway:** The `extra_hosts` setting in `docker-compose.yml` maps `host.docker.internal` to your host's IP address.
-
-### Dockerfile
-
-The Dockerfile uses a multi-stage build:
-
-- **Build stage**: Uses `rust:1.85-alpine` to compile the release binary
-- **Runtime stage**: Uses `alpine:3.20` with only `ca-certificates` for a minimal footprint (~10MB)
-
-### Environment Variables
-
-| Variable      | Description                    | Default                  |
-| ------------- | ------------------------------ | ------------------------ |
-| `OLLAMA_URLS` | URLs of the Ollama servers     | `http://localhost:11434` |
-| `PORT`        | Port for ollamaMQ to listen on | `11435`                  |
-| `TIMEOUT`     | Request timeout in seconds     | `300`                    |
-
-### Connecting to Different Ollama Servers
-
-#### Local Ollama (on host machine)
-
-```bash
-docker run -d \
-  --name ollamamq \
-  -p 11435:11435 \
-  -e OLLAMA_URLS=http://host.docker.internal:11434 \
-  chlebon/ollamamq
-```
-
-#### Remote Ollama Server
-
-```bash
-docker run -d \
-  --name ollamamq \
-  -p 11435:11435 \
-  -e OLLAMA_URLS=https://ollama.example.com:11434 \
-  chlebon/ollamamq
-```
-
-#### Custom Port on Same Server
-
-```bash
-docker run -d \
-  --name ollamamq \
-  -p 8080:8080 \
-  -e OLLAMA_URLS=http://host.docker.internal:11436 \
-  -e PORT=8080 \
-  chlebon/ollamamq
-```
-
-#### Ollama in Docker (different container)
-
-```bash
-docker run -d \
-  --name ollamamq \
-  --network ollama-network \
-  -p 11435:11435 \
-  -e OLLAMA_URLS=http://ollama:11434 \
-  chlebon/ollamamq
-```
-
-### Port Configuration
-
-- **11435**: The proxy port that clients connect to (exposed by default)
-- **11434**: The Ollama server port (internal, not exposed)
-
-To change the proxy port, use the `PORT` environment variable:
-
-```bash
-docker run -d \
-  --name ollamamq \
-  -p 8080:8080 \
-  -e PORT=8080 \
-  chlebon/ollamamq
-```
-
 ## 🏗️ Architecture
 
-- **`src/main.rs`**: Entry point, HTTP server initialization, and TUI lifecycle management.
-- **`src/dispatcher.rs`**: Core logic for queuing, round-robin scheduling, and Ollama proxying.
-- **`src/tui.rs`**: Implementation of the terminal-based monitoring dashboard.
+- **`src/main.rs`**: Entry point handling CLI parsing, HTTP server initialization, model config loading from `models.yaml`, user registry from `users.yaml`, and TUI lifecycle management.
+- **`src/dispatcher.rs`**: Core dispatch engine with model-to-backend routing, fair-share per-user queuing, least-connections load balancing, and background health monitoring.
+- **`src/auth.ts`**: Populates the users regitry from the `users.yaml` config.
+- **`src/tui.rs`**: Real-time dashboard displaying backend status, per-user queue depths, processed counts, and model visibility using public names from config.
+
+### Configuration Files
+
+- **`models.yaml`**: Explicit model-to-backend mappings with optional `public_name` for display names (separates routing from presentation).
+- **`users.yaml`**: User database with SHA256-hashed tokens and optional VIP flag per user.
 
 ### Request Flow
 
-1. Client sends a request with `X-User-ID`.
-2. `ollamaMQ` pushes the request into a user-specific queue.
-3. The background worker checks for available backends (Online & not busy).
-4. If a backend is free, the worker pops the next task (fair-share rotation) and **spawns a parallel task**.
-5. The request is proxied to the selected Ollama backend.
-6. The response is streamed back to the client in real-time, while the worker can immediately start another task on a different backend.
-
-## 📦 Publishing to Docker Hub
-
-To publish a new version of `ollamaMQ` to Docker Hub, follow these steps:
-
-1. **Update Version**: Update the version number in `Cargo.toml`.
-2. **Build and Tag**:
-
-   ```bash
-   # Build the image for the current version
-   docker build -t chlebon/ollamamq:v0.2.4 .
-   
-   # Tag it as latest
-   docker tag chlebon/ollamamq:v0.2.4 chlebon/ollamamq:latest
-   ```
-
-3. **Push to Hub**:
-
-   ```bash
-   # Log in to Docker Hub (if not already logged in)
-   docker login
-   
-   # Push the versioned tag
-   docker push chlebon/ollamamq:v0.2.4
-   
-   # Push the latest tag
-   docker push chlebon/ollamamq:latest
-   ```
+1. Client sends request with `X-User-ID` header.
+2. Authentication via SHA256 token hash lookup; VIP status from config (can be toggled in TUI).
+3. Request placed in user-specific FIFO queue.
+4. Worker selects next user via fair-share scheduling (VIP first, then boosted, then round-robin).
+5. Available backend selected (online, not busy, matching model config).
+6. Task spawned: request proxied to backend with transparent header passthrough.
+7. Response streamed to client; backend freed for next task.
 
 ## 🧪 Development
 
@@ -326,7 +177,7 @@ You can use the provided `test_dispatcher.sh` script to simulate multiple users 
 ./test_dispatcher.sh
 ```
 
-![ollamaMQ Stress Test](demo-test.gif)
+![all-llama-proxy Stress Test](demo-test.gif)
 
 ## 📝 License
 

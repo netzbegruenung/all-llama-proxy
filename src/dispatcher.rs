@@ -7,18 +7,153 @@ use axum::{
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeSet, HashMap, HashSet, VecDeque},
     fs,
+    io::{self, Write},
     net::{IpAddr, SocketAddr},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, RwLock},
+    time::Instant,
 };
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{mpsc, Notify};
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{info, warn};
+use tracing::{info, warn, debug, error};
 
 use crate::auth::UserRegistry;
 
 const BLOCKED_FILE: &str = "blocked_items.json";
+
+/// Format duration showing only seconds if < 1 minute, otherwise minutes and seconds
+fn format_duration_short(d: std::time::Duration) -> String {
+    let secs = d.as_secs();
+    if secs < 60 {
+        format!("{}s", secs)
+    } else {
+        let mins = secs / 60;
+        let remaining_secs = secs % 60;
+        format!("{}m {}s", mins, remaining_secs)
+    }
+}
+
+/// Log entry for the in-TUI log buffer
+pub struct LogEntry {
+    pub level: String,
+    pub message: String,
+}
+
+/// Thread-safe circular buffer for log messages
+#[derive(Clone)]
+pub struct LogBuffer {
+    lines: Arc<RwLock<VecDeque<LogEntry>>>,
+    max_lines: usize,
+}
+
+impl LogBuffer {
+    pub fn new(max_lines: usize) -> Self {
+        Self {
+            lines: Arc::new(RwLock::new(VecDeque::with_capacity(max_lines))),
+            max_lines,
+        }
+    }
+
+    pub fn append(&self, level: &str, message: String) {
+        if let Ok(mut lines) = self.lines.write() {
+            lines.push_back(LogEntry {
+                level: level.to_string(),
+                message,
+            });
+            // Keep only the last max_lines entries
+            while lines.len() > self.max_lines {
+                lines.pop_front();
+            }
+        }
+    }
+
+    pub fn get_last_n(&self, n: usize) -> Vec<(String, String)> {
+        if let Ok(lines) = self.lines.read() {
+            let total = lines.len();
+            lines.iter()
+                .skip(total.saturating_sub(n))
+                .map(|entry| (entry.level.clone(), entry.message.clone()))
+                .collect()
+        } else {
+            Vec::new()
+        }
+    }
+}
+
+/// Writer that captures tracing output into a LogBuffer
+pub struct LogBufferWriter {
+    buffer: LogBuffer,
+    current_line: String,
+}
+
+impl LogBufferWriter {
+    pub fn new(buffer: LogBuffer) -> Self {
+        Self {
+            buffer,
+            current_line: String::new(),
+        }
+    }
+
+    fn parse_and_store(&mut self, line: &str) {
+        // Parse format: "LEVEL: message" or extract level from line
+        let (level, message) = if line.starts_with("DEBUG") {
+            ("DEBUG", line[6..].trim())
+        } else if line.starts_with("INFO") {
+            ("INFO", line[5..].trim())
+        } else if line.starts_with("WARN") {
+            ("WARN", line[5..].trim())
+        } else if line.starts_with("ERROR") {
+            ("ERROR", line[6..].trim())
+        } else {
+            ("INFO", line)
+        };
+
+        self.buffer.append(level, message.to_string());
+    }
+}
+
+impl Write for LogBufferWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if let Ok(line) = std::str::from_utf8(buf) {
+            self.current_line.push_str(line);
+            
+            // Process complete lines (ending with newline)
+            while let Some(pos) = self.current_line.find('\n') {
+                let complete_line = self.current_line[..pos].trim().to_string();
+                if !complete_line.is_empty() {
+                    self.parse_and_store(&complete_line);
+                }
+                self.current_line = self.current_line[pos + 1..].to_string();
+            }
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        // Process any remaining line on flush
+        if !self.current_line.is_empty() {
+            let complete_line = self.current_line.trim().to_string();
+            if !complete_line.is_empty() {
+                self.parse_and_store(&complete_line);
+            }
+            self.current_line.clear();
+        }
+        Ok(())
+    }
+}
+
+/// MakeWriter implementation for LogBufferWriter
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBufferWriter {
+    type Writer = Self;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        LogBufferWriter {
+            buffer: self.buffer.clone(),
+            current_line: String::new(),
+        }
+    }
+}
 
 #[derive(Serialize, Deserialize, Default)]
 struct BlockedConfig {
@@ -27,25 +162,201 @@ struct BlockedConfig {
 }
 
 /// Parsed response from `/api/tags`
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct ModelsResponse {
-    models: Vec<ModelInfo>,
+    models: Vec<serde_json::Value>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
+#[allow(dead_code)]
 struct ModelInfo {
     name: String,
 }
 
-#[derive(Deserialize)]
-struct ModelAliasesConfig {
-    model_aliases: Vec<ModelAliasGroup>,
+// Full model info from backend /api/tags response
+#[derive(Deserialize, Clone)]
+#[allow(dead_code)]
+struct BackendModelInfo {
+    name: String,
+    model: String,
+    modified_at: String,
+    size: u64,
+    digest: String,
+    details: ModelDetails,
 }
 
-#[derive(Deserialize)]
-struct ModelAliasGroup {
-    #[serde(flatten)]
-    entries: HashMap<String, Vec<String>>,
+#[derive(Deserialize, Serialize, Clone)]
+pub(crate) struct ModelDetails {
+    pub(crate) parent_model: String,
+    pub(crate) format: String,
+    pub(crate) family: String,
+    pub(crate) families: Vec<String>,
+    pub(crate) parameter_size: String,
+    pub(crate) quantization_level: String,
+}
+
+// Public-facing model info with public_name substitution
+#[derive(Serialize, Clone)]
+pub(crate) struct PublicModelInfo {
+    pub(crate) name: String,
+    pub(crate) model: String,
+    pub(crate) modified_at: String,
+    pub(crate) size: u64,
+    pub(crate) digest: String,
+    pub(crate) details: ModelDetails,
+}
+
+// Cached tags response
+#[derive(Clone, Serialize)]
+pub(crate) struct CachedTags {
+    pub(crate) models: Vec<PublicModelInfo>,
+}
+
+/// Loaded from models.yaml - explicit model-to-backend mapping
+#[derive(Deserialize, Clone)]
+pub struct ModelConfig {
+    pub models: Vec<ParsedModel>,
+}
+
+/// Individual model configuration with explicit backends and aliases
+#[derive(Deserialize, Clone)]
+pub struct ParsedModel {
+    /// Real model name (required, used for routing)
+    pub name: String,
+    
+    /// Display name for /api/tags and TUI (optional, defaults to name)
+    #[serde(default)]
+    pub public_name: Option<String>,
+    
+    /// Backend URLs that serve this model
+    pub backends: Vec<String>,
+    
+    /// Alias names that resolve to this model
+    #[serde(default)]
+    pub aliases: Vec<String>,
+}
+
+/// Runtime backend status
+#[derive(Clone)]
+pub struct BackendStatus {
+    pub url: String,
+    pub active_requests: usize,
+    pub processed_count: usize,
+    pub is_online: bool,
+    /// Models this backend is configured to serve (from config)
+    pub configured_models: Vec<String>,
+    /// Per-model verification status (true = available, false = not available)
+    pub model_status: Arc<RwLock<HashMap<String, bool>>>,
+}
+
+impl BackendStatus {
+    pub fn new(url: String) -> Self {
+        Self {
+            url,
+            active_requests: 0,
+            processed_count: 0,
+            is_online: true,
+            configured_models: Vec::new(),
+            model_status: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+    
+    /// Check if this backend can serve a specific model
+    pub fn can_serve_model(&self, model_name: &str) -> bool {
+        // Extract base model name (without tag) for flexible matching
+        let request_base = model_name.split(':').next().unwrap_or(model_name);
+        
+        // Check if any configured model matches (by base name or exact)
+        let has_matching_config = self.configured_models.iter().any(|configured| {
+            let configured_base = configured.split(':').next().unwrap_or(configured);
+            configured == model_name || configured_base == request_base
+        });
+        
+        if !has_matching_config {
+            return false;
+        }
+        
+        // Check per-model verification status using base-name matching
+        self.model_status
+            .read()
+            .map(|status| {
+                status.get(model_name)
+                    .copied()
+                    .or_else(|| {
+                        status.iter()
+                            .find(|(k, _)| {
+                                let configured_base = k.split(':').next().unwrap_or(k);
+                                configured_base == request_base
+                            })
+                            .map(|(_, v)| *v)
+                    })
+                    .unwrap_or(true)
+            })
+            .unwrap_or(true)
+    }
+}
+
+impl ModelConfig {
+    /// Load model configuration from YAML file
+    pub fn load(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        let content = fs::read_to_string(path)?;
+        let config: ModelConfig = serde_yaml::from_str(&content)?;
+        
+        // Validate that each model has at least one backend
+        for model in &config.models {
+            if model.backends.is_empty() {
+                return Err(format!("Model '{}' has no backends configured", model.name).into());
+            }
+        }
+        
+        Ok(config)
+    }
+    
+    /// Resolve alias to real model name, returns None if not found
+    pub fn resolve_alias(&self, model_name: &str) -> Option<String> {
+        // Check aliases first
+        for model in &self.models {
+            if model.aliases.contains(&model_name.to_string()) {
+                return Some(model.name.clone());
+            }
+        }
+        
+        // Check if it's already a real model name
+        for model in &self.models {
+            if model.name == model_name {
+                return Some(model.name.clone());
+            }
+        }
+        
+        None
+    }
+    
+    /// Get ParsedModel by name or alias
+    pub fn get_model(&self, model_name: &str) -> Option<&ParsedModel> {
+        self.models.iter().find(|m| {
+            m.name == model_name || m.aliases.contains(&model_name.to_string())
+        })
+    }
+    
+    /// Get all unique backend URLs from all models
+    pub fn get_all_backends(&self) -> BTreeSet<String> {
+        let mut backends = BTreeSet::new();
+        for model in &self.models {
+            for backend in &model.backends {
+                backends.insert(backend.clone());
+            }
+        }
+        backends
+    }
+    
+    /// Get models configured for a specific backend
+    pub fn get_models_for_backend(&self, backend_url: &str) -> Vec<String> {
+        self.models
+            .iter()
+            .filter(|m| m.backends.contains(&backend_url.to_string()))
+            .map(|m| m.name.clone())
+            .collect()
+    }
 }
 
 pub enum ResponsePart {
@@ -62,16 +373,10 @@ pub struct Task {
     pub headers: HeaderMap,
     pub body: Bytes,
     pub responder: mpsc::Sender<ResponsePart>,
+    pub resolved_model: Option<String>,
 }
 
-#[derive(Clone)]
-pub struct BackendStatus {
-    pub url: String,
-    pub active_requests: usize,
-    pub processed_count: usize,
-    pub is_online: bool,
-    pub available_models: HashSet<String>,
-}
+
 
 pub struct AppState {
     pub queues: Mutex<HashMap<String, VecDeque<Task>>>,
@@ -81,7 +386,7 @@ pub struct AppState {
     pub user_ips: Mutex<HashMap<String, IpAddr>>,
     pub blocked_ips: Mutex<HashSet<IpAddr>>,
     pub blocked_users: Mutex<HashSet<String>>,
-    pub vip_user: Mutex<Option<String>>,
+    pub vip_user: Mutex<Vec<String>>,
     pub boost_user: Mutex<Option<String>>,
     pub global_counter: Mutex<usize>,
     pub notify: Notify,
@@ -89,37 +394,66 @@ pub struct AppState {
     pub backends: Mutex<Vec<BackendStatus>>,
     pub last_backend_idx: Mutex<usize>,
     pub timeout: u64,
-    /// User registry loaded from `/etc/ollama-mq/users.yaml`.
-    /// Wrapped in `Arc` so the SIGHUP handler can atomically swap it.
+    /// User registry loaded from users.yaml
     pub user_registry: Mutex<Arc<UserRegistry>>,
-    /// Model aliases: alias_name → real_model_name
-    pub model_aliases: Mutex<HashMap<String, String>>,
+    /// Model configuration: real models with backends and aliases
+    pub model_config: Arc<RwLock<ModelConfig>>,
+    /// Debug mode: enable verbose logging
+    pub debug: bool,
+    /// Shared log buffer for in-TUI logging
+    pub log_buffer: LogBuffer,
+    /// HTTP header to extract real client IP from
+    pub ip_header: Option<String>,
+    /// Cached /api/tags response with merged models
+    pub cached_tags: Arc<RwLock<Option<CachedTags>>>,
 }
 
 impl AppState {
     pub fn new(
-        ollama_urls: Vec<String>,
+        model_config_path: String,
         timeout: u64,
         registry: UserRegistry,
-        model_aliases_path: Option<String>,
+        debug: bool,
+        log_buffer: LogBuffer,
+        ip_header: Option<String>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let (blocked_ips, blocked_users) = Self::load_blocked_items();
-        let backends = ollama_urls.into_iter()
-            .map(|url| BackendStatus {
-                url,
-                active_requests: 0,
-                processed_count: 0,
-                is_online: true,
-                available_models: HashSet::new(),
+        
+        // Load model configuration (required, will crash if missing)
+        let model_config = ModelConfig::load(&model_config_path)?;
+        info!("Loaded model configuration from {}", model_config_path);
+        
+        // Build deduplicated backend list from config
+        let backend_urls = model_config.get_all_backends();
+        
+        // Create BackendStatus entries with model configuration
+        let mut backends: Vec<BackendStatus> = backend_urls.into_iter()
+            .map(|url| {
+                let mut backend = BackendStatus::new(url.clone());
+                backend.configured_models = model_config.get_models_for_backend(&url);
+                
+                // Initialize model_status to true for all configured models
+                // (optimistic: assume available until health check proves otherwise)
+                let mut initial_status = HashMap::new();
+                for model_name in &backend.configured_models {
+                    initial_status.insert(model_name.clone(), true);
+                }
+                *backend.model_status.write().unwrap() = initial_status;
+                
+                backend
             })
             .collect();
-
-        // Load model aliases if path is specified
-        let model_aliases = if let Some(path) = model_aliases_path {
-            ModelAliasesConfig::load(&path)?
-        } else {
-            HashMap::new()
-        };
+        
+        // Sort backends for consistent ordering (optional, for TUI display)
+        backends.sort_by(|a, b| a.url.cmp(&b.url));
+        
+        info!("{} backends configured from model config", backends.len());
+        for backend in &backends {
+            info!("  Backend {}: serves {} models", 
+                backend.url, 
+                backend.configured_models.len()
+            );
+        }
 
         Ok(Self {
             queues: Mutex::new(HashMap::new()),
@@ -129,7 +463,7 @@ impl AppState {
             user_ips: Mutex::new(HashMap::new()),
             blocked_ips: Mutex::new(blocked_ips),
             blocked_users: Mutex::new(blocked_users),
-            vip_user: Mutex::new(None),
+            vip_user: Mutex::new(registry.get_vip_users()),
             boost_user: Mutex::new(None),
             global_counter: Mutex::new(0),
             notify: Notify::new(),
@@ -138,8 +472,49 @@ impl AppState {
             last_backend_idx: Mutex::new(0),
             timeout,
             user_registry: Mutex::new(Arc::new(registry)),
-            model_aliases: Mutex::new(model_aliases),
+            model_config: Arc::new(RwLock::new(model_config)),
+            debug,
+            log_buffer,
+            ip_header,
+            cached_tags: Arc::new(RwLock::new(None)),
         })
+    }
+    
+    /// Reload model configuration (called from SIGHUP handler)
+    pub fn reload_model_config(&self, path: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let new_config = ModelConfig::load(path)?;
+        
+        // Update the config
+        {
+            let mut write_guard = self.model_config.write().unwrap();
+            *write_guard = new_config.clone();
+        }
+        
+        // Update backend configurations
+        {
+            let mut backends = self.backends.lock().unwrap();
+            for backend in backends.iter_mut() {
+                backend.configured_models = new_config.get_models_for_backend(&backend.url);
+                
+                // Preserve existing per-model status for models that remain configured
+                let mut new_status = HashMap::new();
+                for model_name in &backend.configured_models {
+                    // Check old status, default to true if not known
+                    let old_status = self.model_config.read().unwrap()
+                        .get_model(model_name)
+                        .map(|_| {
+                            // Try to get old status
+                            backend.model_status.read().unwrap()
+                                .get(model_name).copied()
+                        });
+                    
+                    new_status.insert(model_name.clone(), old_status.flatten().unwrap_or(true));
+                }
+                *backend.model_status.write().unwrap() = new_status;
+            }
+        }
+        
+        Ok(())
     }
 
     fn load_blocked_items() -> (HashSet<IpAddr>, HashSet<String>) {
@@ -206,29 +581,6 @@ impl AppState {
     pub fn is_user_blocked(&self, user_id: &str) -> bool {
         self.blocked_users.lock().unwrap().contains(user_id)
     }
-
-    /// Reload model aliases from the specified YAML file
-    pub fn reload_model_aliases(&self, path: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let aliases = ModelAliasesConfig::load(path)?;
-        *self.model_aliases.lock().unwrap() = aliases;
-        Ok(())
-    }
-}
-
-impl ModelAliasesConfig {
-    fn load(path: &str) -> Result<HashMap<String, String>, Box<dyn std::error::Error>> {
-        let content = std::fs::read_to_string(path)?;
-        let parsed: ModelAliasesConfig = serde_yaml::from_str(&content)?;
-        let mut map = HashMap::new();
-        for group in parsed.model_aliases {
-            for (real_name, aliases) in group.entries {
-                for alias in aliases {
-                    map.insert(alias, real_name.clone());
-                }
-            }
-        }
-        Ok(map)
-    }
 }
 
 /// Paths that carry a `model` field in their JSON body.
@@ -242,25 +594,47 @@ const MODEL_PATHS: &[&str] = &[
     "/v1/embeddings",
 ];
 
-/// Extract the `model` field from the request body when the path is model-aware.
+/// Extract and resolve the `model` field from the request body when the path is model-aware.
 /// If the model is an alias, it's replaced with the real name in the body.
 /// Returns `None` for non-model endpoints or when the field is absent.
-fn extract_model_name(body: &mut Bytes, path: &str, aliases: &Mutex<HashMap<String, String>>) -> Option<String> {
+/// Returns `Some(model_name)` even if not in config (will be 503'd later).
+fn extract_and_resolve_model(
+    body: &mut Bytes,
+    path: &str,
+    config: &ModelConfig,
+    debug_enabled: bool,
+) -> Option<String> {
     if !MODEL_PATHS.iter().any(|p| path.starts_with(p)) {
+        if debug_enabled { debug!("Path {} is not a model path", path); }
         return None;
     }
 
     let mut v: serde_json::Value = serde_json::from_slice(body).ok()?;
-    let model_str = v.get("model")?.as_str()?.to_string();
+    let requested_model = v.get("model")?.as_str()?.to_string();
+    
+    if debug_enabled {
+        debug!("Requested model: {} on path {}", requested_model, path);
+    }
 
-    // Check if this is an alias and resolve it
-    let real_model = {
-        let aliases_map = aliases.lock().unwrap();
-        aliases_map.get(&model_str).cloned().unwrap_or_else(|| model_str.clone())
+    // Resolve alias to real model name
+    let real_model = match config.resolve_alias(&requested_model) {
+        Some(resolved) => {
+            if debug_enabled {
+                debug!("Resolved {} -> {}", requested_model, resolved);
+            }
+            resolved
+        }
+        None => {
+            // Not in config at all - don't modify body, will 503 later
+            if debug_enabled {
+                debug!("Model {} not found in config", requested_model);
+            }
+            return Some(normalize_model_tag(&requested_model));
+        }
     };
 
-    // If we resolved an alias, update the request body
-    if real_model != model_str {
+    // Update body with real model name
+    if real_model != requested_model {
         if let Some(obj) = v.as_object_mut() {
             obj.insert("model".to_string(), serde_json::json!(real_model));
             *body = Bytes::from(serde_json::to_vec(&v).ok()?);
@@ -268,6 +642,14 @@ fn extract_model_name(body: &mut Bytes, path: &str, aliases: &Mutex<HashMap<Stri
     }
 
     Some(normalize_model_tag(&real_model))
+}
+
+/// Peek at the model name from a request body without modifying it.
+/// Used for routing decisions before actually consuming the task.
+fn peek_model_from_body(body: &Bytes) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let requested_model = v.get("model")?.as_str()?.to_string();
+    Some(requested_model)
 }
 
 /// Append `:latest` if the model name has no explicit tag.
@@ -279,11 +661,68 @@ fn normalize_model_tag(name: &str) -> String {
     }
 }
 
-/// True if `available` contains the requested model.
-/// Both sides are normalized to `name:tag` before comparison.
-fn backend_has_model(available: &HashSet<String>, requested: &str) -> bool {
-    let norm = normalize_model_tag(requested);
-    available.iter().any(|m| normalize_model_tag(m) == norm)
+/// Build merged /api/tags cache from all configured models using their first backends
+async fn build_tags_cache(state: &AppState, client: &reqwest::Client) -> Result<(), Box<dyn std::error::Error>> {
+    // Clone model list to release the lock before awaiting
+    let models_to_fetch: Vec<(String, Option<String>, String)> = {
+        let config = state.model_config.read().unwrap();
+        config.models.iter()
+            .filter(|m| !m.backends.is_empty())
+            .map(|m| (m.name.clone(), m.public_name.clone(), m.backends[0].clone()))
+            .collect()
+    };
+    
+    let mut merged_models: Vec<PublicModelInfo> = Vec::new();
+
+    for (model_name, public_name_opt, backend_url) in models_to_fetch {
+        let url = format!("{}/api/tags", backend_url);
+
+        match client.get(&url).send().await {
+            Ok(resp) => {
+                if let Ok(backend_response) = resp.json::<ModelsResponse>().await {
+                    // Find matching model in backend response
+                    if let Some(backend_model) = backend_response.models.iter()
+                        .find(|value| {
+                            if let Some(name) = value.get("name").and_then(|v| v.as_str()) {
+                                name == model_name || name.starts_with(model_name.as_str())
+                            } else {
+                                false
+                            }
+                        })
+                    {
+                        // Parse the backend model with all fields
+                        if let Ok(backend_info) = serde_json::from_value::<BackendModelInfo>(backend_model.clone()) {
+                            // Get public_name (or fallback to name)
+                            let public_name = public_name_opt.as_ref()
+                                .unwrap_or(&model_name);
+
+                            // Create PublicModelInfo with public_name overriding name/model
+                            merged_models.push(PublicModelInfo {
+                                name: public_name.clone(),
+                                model: public_name.clone(),
+                                modified_at: backend_info.modified_at,
+                                size: backend_info.size,
+                                digest: backend_info.digest,
+                                details: backend_info.details,
+                            });
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                debug!("Failed to fetch /api/tags from {} for model {}: {}", backend_url, model_name, e);
+            }
+        }
+    }
+
+    // Update cache
+    {
+        let mut cache = state.cached_tags.write().unwrap();
+        *cache = Some(CachedTags { models: merged_models });
+        debug!("Built cache with {} models", cache.as_ref().unwrap().models.len());
+    }
+
+    Ok(())
 }
 
 pub async fn run_worker(state: Arc<AppState>) {
@@ -297,6 +736,9 @@ pub async fn run_worker(state: Arc<AppState>) {
     let health_state = state.clone();
     let health_client = client.clone();
     tokio::spawn(async move {
+        // Build initial cache
+        let _ = build_tags_cache(&health_state, &health_client).await;
+
         loop {
             let backends_to_check: Vec<(usize, String)> = {
                 let backends = health_state.backends.lock().unwrap();
@@ -307,30 +749,78 @@ pub async fn run_worker(state: Arc<AppState>) {
                 let check_url = format!("{}/api/tags", url);
                 match health_client.get(&check_url).send().await {
                     Ok(resp) => {
-                        // Parse available models from the response body.
-                        let models: HashSet<String> = resp
+                        // Parse full model info from the response
+                        let backend_models: Vec<BackendModelInfo> = resp
                             .json::<ModelsResponse>()
                             .await
-                            .map(|mr| mr.models.into_iter().map(|m| m.name).collect())
+                            .map(|mr| mr.models.into_iter()
+                                .filter_map(|value| {
+                                    serde_json::from_value::<BackendModelInfo>(value).ok()
+                                })
+                                .collect())
                             .unwrap_or_default();
 
                         let mut backends = health_state.backends.lock().unwrap();
-                        if !backends[idx].is_online {
-                            info!("Backend {} status changed to: ONLINE", url);
-                            backends[idx].is_online = true;
+                        let backend = &mut backends[idx];
+                        
+                        // Mark as online
+                        if !backend.is_online {
+                            info!("Backend {} is back online", url);
+                            backend.is_online = true;
                         }
-                        backends[idx].available_models = models;
+                        
+                        // Update per-model status (use base-name matching)
+                        let mut model_status = backend.model_status.write().unwrap();
+                        let backend_model_names: HashSet<String> = backend_models.iter()
+                            .map(|m| m.name.clone())
+                            .collect();
+                        
+                        for configured_model in &backend.configured_models {
+                            let config_base = configured_model.split(':').next().unwrap_or(configured_model);
+                            let was_available = model_status.get(configured_model).copied().unwrap_or(true);
+                            
+                            // Check if backend has any model with matching base name
+                            let is_available = backend_model_names.iter().any(|backend_model| {
+                                let backend_base = backend_model.split(':').next().unwrap_or(backend_model);
+                                backend_base == config_base
+                            });
+                            
+                            if was_available && !is_available {
+                                warn!(
+                                    "Backend {} no longer has model {} available (but is configured)",
+                                    url, configured_model
+                                );
+                            } else if !was_available && is_available {
+                                info!(
+                                    "Backend {} now has model {} available",
+                                    url, configured_model
+                                );
+                            }
+                            
+                            model_status.insert(configured_model.clone(), is_available);
+                        }
                     }
                     Err(_) => {
                         let mut backends = health_state.backends.lock().unwrap();
-                        if backends[idx].is_online {
-                            info!("Backend {} status changed to: OFFLINE", url);
-                            backends[idx].is_online = false;
+                        let backend = &mut backends[idx];
+                        
+                        if backend.is_online {
+                            info!("Backend {} went offline", url);
+                            backend.is_online = false;
                         }
-                        backends[idx].available_models.clear();
+                        
+                        // Mark all configured models as unavailable
+                        let mut model_status = backend.model_status.write().unwrap();
+                        for model_name in &backend.configured_models {
+                            model_status.insert(model_name.clone(), false);
+                        }
                     }
                 }
             }
+            
+            // Build merged cache after checking all backends
+            let _ = build_tags_cache(&health_state, &health_client).await;
+            
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
         }
     });
@@ -358,7 +848,7 @@ pub async fn run_worker(state: Arc<AppState>) {
                 SelectionResult::Wait
             } else {
                 let mut target_user = None;
-                let vip = state.vip_user.lock().unwrap().clone();
+                let vip_list = state.vip_user.lock().unwrap().clone();
                 let boost = state.boost_user.lock().unwrap().clone();
                 let mut counter = state.global_counter.lock().unwrap();
 
@@ -376,12 +866,20 @@ pub async fn run_worker(state: Arc<AppState>) {
                         a_total.cmp(&b_total).then_with(|| a.cmp(b))
                     });
 
-                    if let Some(ref v) = vip { if active_users.contains(v) { target_user = Some(v.clone()); } }
+                    // Priority: VIP users first (in order), then boost user, then round-robin
+                    for vip_user in &vip_list {
+                        if active_users.contains(vip_user) {
+                            target_user = Some(vip_user.clone());
+                            break;
+                        }
+                    }
+
                     if target_user.is_none() {
                         if let Some(ref b) = boost {
                             if active_users.contains(b) && *counter % 2 == 0 { target_user = Some(b.clone()); }
                         }
                     }
+
                     if target_user.is_none() {
                         if current_idx >= active_users.len() { current_idx = 0; }
                         target_user = Some(active_users[current_idx].clone());
@@ -390,34 +888,121 @@ pub async fn run_worker(state: Arc<AppState>) {
 
                     match target_user {
                         Some(user_id) => {
-                            let mut task = queues.get_mut(&user_id).unwrap().pop_front().unwrap();
-                            *counter += 1;
+                            // Peek at the task to get the model BEFORE popping
+                            let task_body = queues.get(&user_id).unwrap().front().unwrap().body.clone();
+                            
+                            let is_debug = state.debug;
+                            let config = state.model_config.read().unwrap();
+                            
+                            // Peek at the original requested model name
+                            let requested_model = peek_model_from_body(&task_body);
+                            
+                            // Resolve alias to get the real model name (for routing decisions)
+                            let resolved_model = requested_model.clone()
+                                .and_then(|model| {
+                                    // Check if this is an alias that needs resolution
+                                    if let Some(resolved) = config.resolve_alias(&model) {
+                                        Some(resolved)
+                                    } else if config.get_model(&model).is_some() {
+                                        // Already a real model name, normalize it
+                                        Some(normalize_model_tag(&model))
+                                    } else {
+                                        // Not in config at all
+                                        None
+                                    }
+                                })
+                                .map(|m| normalize_model_tag(&m));
 
-                            // Filter backends by model availability.
-                            let task_body_ref = &mut task.body;
-                            let model_opt = extract_model_name(task_body_ref, &task.path, &state.model_aliases);
-                            let eligible: Vec<usize> = if let Some(ref model) = model_opt {
-                                online_indices.iter().cloned()
-                                    .filter(|&i| backend_has_model(&backends[i].available_models, model))
-                                    .collect()
-                            } else {
-                                online_indices.clone()
-                            };
+                            drop(config);
+                            
+                            match resolved_model {
+                                Some(model) => {
+                                    // Filter backends: can serve this model
+                                    let eligible: Vec<usize> = online_indices.iter().cloned()
+                                        .filter(|&i| backends[i].can_serve_model(&model))
+                                        .collect();
+                                    
+                                    if eligible.is_empty() {
+                                        // No eligible backend - wait, do NOT pop the task
+                                        if is_debug {
+                                            debug!("No backend can serve model '{}' for user {}", model, user_id);
+                                        }
+                                        SelectionResult::Wait
+                                    } else {
+                                        // NOW pop the task (backend is guaranteed available)
+                                    let mut task = queues.get_mut(&user_id).unwrap().pop_front().unwrap();
+                                        *counter += 1;
 
-                            if eligible.is_empty() {
-                                let model_name = model_opt.unwrap_or_default();
-                                SelectionResult::ModelNotFound(task, model_name)
-                            } else {
-                                // Round-Robin among eligible backends with min connections
-                                let min_conns = eligible.iter().map(|&i| backends[i].active_requests).min().unwrap();
-                                let candidates: Vec<usize> = eligible.iter().cloned().filter(|&i| backends[i].active_requests == min_conns).collect();
-                                let candidate_pos = candidates.iter().position(|&i| i > *last_idx).unwrap_or(0);
-                                let selected_backend_idx = candidates[candidate_pos];
-
-                                *last_idx = selected_backend_idx;
-                                backends[selected_backend_idx].active_requests += 1;
-
-                                SelectionResult::Dispatch(user_id, task, selected_backend_idx, backends[selected_backend_idx].url.clone())
+                                        // Resolve alias in body (mutate the body)
+                                        let task_body_ref = &mut task.body;
+                                        let config = state.model_config.read().unwrap();
+                                        let resolved_model_name = extract_and_resolve_model(task_body_ref, &task.path, &config, is_debug);
+                                        
+                                        // Store resolved model in task and log if alias was used
+                                        if let Some(ref resolved) = resolved_model_name {
+                                            task.resolved_model = Some(resolved.clone());
+                                            
+                                            // Log alias rewrite if different from requested
+                                            let orig_normalized = requested_model
+                                                .as_ref()
+                                                .map(|m| normalize_model_tag(m))
+                                                .or_else(|| Some(resolved.clone()));
+                                            
+                                            if orig_normalized.as_ref() != Some(resolved) {
+                                                info!("Mapped requested model {} to {} for user {}", 
+                                                    requested_model.as_deref().unwrap_or("unknown"),
+                                                    resolved,
+                                                    user_id); 
+                                            }
+                                        }
+                    
+                                        let selected_backend_idx = {
+                                            let min_conns = eligible.iter()
+                                                .map(|&i| backends[i].active_requests)
+                                                .min()
+                                                .unwrap();
+                                            let candidates: Vec<usize> = eligible.iter()
+                                                .cloned()
+                                                .filter(|&i| backends[i].active_requests == min_conns)
+                                                .collect();
+                                            let candidate_pos = candidates.iter()
+                                                .position(|&i| i > *last_idx)
+                                                .unwrap_or(0);
+                                            let selected = candidates[candidate_pos];
+                                            *last_idx = selected;
+                                            selected
+                                        };
+                        
+                                        if is_debug {
+                                            debug!("Selected backend {} (idx {}) for user {}, model {}", 
+                                                backends[selected_backend_idx].url, 
+                                                selected_backend_idx, 
+                                                user_id, 
+                                                model
+                                            );
+                                        }
+                        
+                                        backends[selected_backend_idx].active_requests += 1;
+                                        SelectionResult::Dispatch(
+                                            user_id,
+                                            task,
+                                            selected_backend_idx,
+                                            backends[selected_backend_idx].url.clone()
+                                        )
+                                    }
+                                }
+                                None => {
+                                    // Model not in config - pop and fail
+                                    let task = queues.get_mut(&user_id).unwrap().pop_front().unwrap();
+                                    *counter += 1;
+                                    
+                                    if is_debug {
+                                        debug!("Model not in config for user {}", user_id);
+                                    }
+                                    
+                                    SelectionResult::ModelNotFound(task, 
+                                        requested_model.unwrap_or("unknown".to_string()))
+                                }
                             }
                         }
                         None => SelectionResult::Wait,
@@ -445,7 +1030,14 @@ pub async fn run_worker(state: Arc<AppState>) {
                 let client_clone = client.clone();
                 let url = format!("{}{}", backend_url, task.path);
 
+                if state.debug {
+                    debug!("Spawning task for user {} -> backend {} ({})", 
+                        user_id, backend_url, task.path);
+                }
+
                 tokio::spawn(async move {
+                    let start = Instant::now();
+                    
                     let is_blocked = {
                         let user_ips = state_clone.user_ips.lock().unwrap();
                         let blocked_ips = state_clone.blocked_ips.lock().unwrap();
@@ -462,6 +1054,18 @@ pub async fn run_worker(state: Arc<AppState>) {
                             *processing.entry(user_id.clone()).or_insert(0) += 1;
                         }
 
+                        if state_clone.debug {
+                            debug!("=== BACKEND REQUEST ===");
+                            debug!("URL: {}", url);
+                            debug!("Method: {:?}", task.method);
+                            debug!("Headers: {:?}", task.headers);
+                            if let Ok(body_str) = std::str::from_utf8(&task.body) {
+                                debug!("Body: {}", body_str);
+                            } else {
+                                debug!("Body: <binary data> {} bytes", task.body.len());
+                            }
+                        }
+
                         let res_fut = client_clone.request(task.method, &url)
                             .headers(task.headers)
                             .body(task.body)
@@ -470,6 +1074,12 @@ pub async fn run_worker(state: Arc<AppState>) {
                         match res_fut.await {
                             Ok(response) => {
                                 let status = response.status();
+                                
+                                if state_clone.debug {
+                                    debug!("Backend {} responded with status {} for user {}", 
+                                        backend_url, status, user_id);
+                                }
+                                
                                 let mut headers = response.headers().clone();
                                 headers.remove(axum::http::header::TRANSFER_ENCODING);
                                 headers.remove(axum::http::header::CONTENT_LENGTH);
@@ -492,6 +1102,16 @@ pub async fn run_worker(state: Arc<AppState>) {
                                     if !client_disconnected {
                                         let mut counts = state_clone.processed_counts.lock().unwrap();
                                         *counts.entry(user_id.clone()).or_insert(0) += 1;
+                    
+                                        // Log completion
+                                        let model_info = task.resolved_model
+                                            .as_ref()
+                                            .map(|m| format!(" using {}", m))
+                                            .unwrap_or_default();
+                                        info!("Request finished for user {}{}, duration {}", 
+                                            user_id,
+                                            model_info,
+                                            format_duration_short(start.elapsed()));
                                     } else {
                                         let mut dropped = state_clone.dropped_counts.lock().unwrap();
                                         *dropped.entry(user_id.clone()).or_insert(0) += 1;
@@ -499,9 +1119,20 @@ pub async fn run_worker(state: Arc<AppState>) {
                                 }
                             }
                             Err(e) => {
+                                error!("Backend {} request failed for user {}: {}", backend_url, user_id, e);
                                 let _ = task.responder.send(ResponsePart::Error(e)).await;
                                 let mut dropped = state_clone.dropped_counts.lock().unwrap();
                                 *dropped.entry(user_id.clone()).or_insert(0) += 1;
+                                
+                                // Log failure
+                                let model_info = task.resolved_model
+                                    .as_ref()
+                                    .map(|m| format!(" using {}", m))
+                                    .unwrap_or_default();
+                                info!("Request failed for user {}{}, duration {}", 
+                                    user_id,
+                                    model_info,
+                                    format_duration_short(start.elapsed()));
                             }
                         }
 
@@ -538,7 +1169,16 @@ pub async fn proxy_handler(
     body: Bytes,
 ) -> impl IntoResponse {
     let path = uri.path().to_string();
-    let ip = addr.ip();
+    let ip = if let Some(header_name) = &state.ip_header {
+        headers
+            .get(header_name)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.split(',').next().and_then(|ip| ip.trim().parse().ok()))
+            .unwrap_or_else(|| addr.ip())
+    } else {
+        addr.ip()
+    };
+    let is_debug = state.debug;
 
     // --- Authentication ---
     // Extract and validate the Bearer token from the Authorization header.
@@ -549,7 +1189,11 @@ pub async fn proxy_handler(
     {
         Some(token) => token.to_string(),
         None => {
-            warn!("Rejected request from {}: missing or malformed Authorization header", ip);
+            if is_debug { 
+                debug!("Rejected request from {}: missing or malformed Authorization header", ip);
+            } else {
+                warn!("Rejected request from {}: missing or malformed Authorization header", ip);
+            }
             return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
         }
     };
@@ -557,13 +1201,31 @@ pub async fn proxy_handler(
     let user_id = {
         let registry = state.user_registry.lock().unwrap().clone();
         match registry.authenticate(&raw_token) {
-            Some(uid) => uid.to_string(),
+            Some(uid) => {
+                if is_debug {
+                    debug!("Authenticated user: {} from IP: {}", uid, ip);
+                }
+                uid.to_string()
+            }
             None => {
-                warn!("Rejected request from {}: invalid token", ip);
+                if is_debug { 
+                    debug!("Rejected request from {}: invalid token", ip);
+                } else {
+                    warn!("Rejected request from {}: invalid token", ip);
+                }
                 return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
             }
         }
     };
+
+    if is_debug {
+        debug!("Request from user: {} to {} {}", user_id, method, path);
+        if path.starts_with("/api/generate") || path.starts_with("/api/chat") {
+            if let Ok(body_str) = std::str::from_utf8(&body) {
+                debug!("Request body: {}", body_str);
+            }
+        }
+    }
 
     if state.is_ip_blocked(&ip) {
         warn!("Blocked request from IP: {} for user: {}", ip, user_id);
@@ -583,6 +1245,8 @@ pub async fn proxy_handler(
     let (tx, rx) = mpsc::channel(32);
     let mut task_headers = headers.clone();
     task_headers.remove(axum::http::header::HOST);
+    task_headers.remove(axum::http::header::AUTHORIZATION);
+    task_headers.remove(axum::http::header::CONTENT_LENGTH);
 
     let task = Task {
         path,
@@ -590,6 +1254,7 @@ pub async fn proxy_handler(
         headers: task_headers,
         responder: tx,
         body,
+        resolved_model: None,
     };
 
     {
@@ -602,9 +1267,16 @@ pub async fn proxy_handler(
 
     state.notify.notify_one();
 
+    if is_debug {
+        debug!("Task queued for user: {}", user_id);
+    }
+
     let mut rx = rx;
     match rx.recv().await {
         Some(ResponsePart::Status(status, headers)) => {
+            if is_debug {
+                debug!("Received response status {} for user: {}", status, user_id);
+            }
             let stream = ReceiverStream::new(rx).map(|part| {
                 match part {
                     ResponsePart::Chunk(chunk) => Ok(chunk),
@@ -619,8 +1291,62 @@ pub async fn proxy_handler(
             res
         }
         Some(ResponsePart::Error(e)) => {
+            error!("Backend error for user {}: {}", user_id, e);
             (StatusCode::INTERNAL_SERVER_ERROR, format!("Backend error: {}", e)).into_response()
         }
-        _ => (StatusCode::INTERNAL_SERVER_ERROR, "Worker failed to respond").into_response(),
+        _ => {
+            error!("Worker failed to respond for user {}", user_id);
+            (StatusCode::INTERNAL_SERVER_ERROR, "Worker failed to respond").into_response()
+        }
+    }
+}
+
+pub async fn tags_handler(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    _method: Method,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    // Extract IP
+    let ip = if let Some(header_name) = &state.ip_header {
+        headers
+            .get(header_name)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.split(',').next().and_then(|ip| ip.trim().parse().ok()))
+            .unwrap_or_else(|| addr.ip())
+    } else {
+        addr.ip()
+    };
+
+    // Authentication
+    let raw_token = match headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+    {
+        Some(token) => token.to_string(),
+        None => return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response(),
+    };
+
+    let user_id = match state.user_registry.lock().unwrap().authenticate(&raw_token) {
+        Some(uid) => uid.to_string(),
+        None => return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response(),
+    };
+
+    // Check blocking
+    if state.is_ip_blocked(&ip) {
+        warn!("Blocked tags request from IP: {} for user: {}", ip, user_id);
+        return (StatusCode::FORBIDDEN, "IP blocked").into_response();
+    }
+    if state.is_user_blocked(&user_id) {
+        warn!("Blocked tags request from user: {} (IP: {})", user_id, ip);
+        return (StatusCode::FORBIDDEN, "User blocked").into_response();
+    }
+
+    // Return cached response (or empty list if not populated)
+    let cache = state.cached_tags.read().unwrap();
+    match cache.as_ref() {
+        Some(cached_tags) => (StatusCode::OK, axum::Json(cached_tags.clone())).into_response(),
+        None => (StatusCode::OK, axum::Json(serde_json::json!({"models": []}))).into_response(),
     }
 }

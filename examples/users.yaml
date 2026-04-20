@@ -1,0 +1,13 @@
+users:
+  # hash of 'changeme-alice'
+- token_hash: 9d749074378df5b8cece6d36fd88e2cfc3a06d8bedee2cd9a0c410e95145c4c9
+  user_id: alice
+  vip: true
+
+  # hash of 'changeme-bob'
+- token_hash: 7e1b7658b063919d77c1d7e6c6d94c300b31829b592d233b977ad2022272e87f
+  user_id: bob
+
+  # hash of 'changeme-charlie'
+- token_hash: 348c6e59c66a84fe000d740b5d937530b9bc34b777412355a94031dc539039ea
+  user_id: charlie

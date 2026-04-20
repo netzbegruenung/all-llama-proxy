@@ -3,6 +3,7 @@ use axum::{
     routing::{any, get},
 };
 use clap::Parser;
+use std::io::IsTerminal;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use tokio::signal::unix::{signal, SignalKind};
@@ -15,9 +16,7 @@ mod dispatcher;
 mod tui;
 
 use crate::auth::UserRegistry;
-use crate::dispatcher::{AppState, proxy_handler, run_worker};
-
-use std::io::IsTerminal;
+use crate::dispatcher::{AppState, LogBuffer, LogBufferWriter, proxy_handler, tags_handler, run_worker};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -26,29 +25,29 @@ struct Args {
     #[arg(short, long, default_value_t = 11435)]
     port: u16,
 
-    /// Ollama server URLs (comma-separated list)
-    #[arg(short, long, value_delimiter = ',', default_value = "http://localhost:11434")]
-    ollama_urls: Vec<String>,
-
     /// Request timeout in seconds
     #[arg(short, long, default_value_t = 300)]
     timeout: u64,
 
-    /// Disable TUI dashboard
+    /// Enable TUI dashboard
     #[arg(long)]
-    no_tui: bool,
-
-    /// Allow all routes (enable fallback proxy)
-    #[arg(long, default_value_t = false)]
-    allow_all_routes: bool,
+    tui: bool,
 
     /// Path to users.yaml file for authentication
-    #[arg(long, default_value = "/etc/ollama-mq/users.yaml")]
+    #[arg(long, default_value = "/etc/all-llama-proxy/users.yaml")]
     users_path: String,
 
-    /// Path to model aliases YAML file (optional)
+    /// Path to models.yaml file (required - backends come from here)
+    #[arg(long, default_value = "/etc/all-llama-proxy/models.yaml")]
+    model_config_path: String,
+
+    /// Enable verbose debug logging
     #[arg(long)]
-    model_aliases_path: Option<String>,
+    debug: bool,
+
+    /// HTTP header to extract real client IP from (e.g., X-Real-IP, X-Forwarded-For)
+    #[arg(short = 'i', long = "ip-header")]
+    ip_header: Option<String>,
 }
 
 struct TuiState {
@@ -59,38 +58,40 @@ struct TuiState {
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
-    let ollama_urls: Vec<String> = args.ollama_urls.iter()
-        .map(|url| url.trim_end_matches('/').to_string())
-        .collect();
 
     // Determine if we should run TUI
-    let use_tui = !args.no_tui && std::io::stdout().is_terminal();
+    let use_tui = args.tui && std::io::stdout().is_terminal();
 
-    // Keep the guard alive for the duration of main
-    let _guard: Option<tracing_appender::non_blocking::WorkerGuard>;
+    // Configure logging based on TUI mode
+    let log_level = if args.debug { "debug" } else { "info" };
 
-    if use_tui {
-        let file_appender = tracing_appender::rolling::never(".", "ollamamq.log");
-        let (non_blocking, g) = tracing_appender::non_blocking(file_appender);
-        _guard = Some(g);
-
+    let log_buffer = if use_tui {
+        // TUI mode: create shared log buffer, log to stderr (won't corrupt TUI stdout)
+        let log_buffer = LogBuffer::new(100);
+        
         tracing_subscriber::fmt()
-            .with_writer(non_blocking)
+            .with_writer(LogBufferWriter::new(log_buffer.clone()))
             .with_ansi(false)
-            .with_env_filter(
-                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-            )
+            .with_env_filter(EnvFilter::new(log_level))
+            .with_level(true)
+            .with_line_number(false)
+            .compact()
             .init();
+        
+        Some(log_buffer)
     } else {
-        _guard = None;
+        // Non-TUI mode: log to stdout with colors
         tracing_subscriber::fmt()
-            .with_env_filter(
-                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-            )
+            .with_writer(std::io::stdout)
+            .with_ansi(true)
+            .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(log_level)))
             .init();
-    }
+        
+        None
+    };
 
     // Load user registry from CLI-specified path.
+    // Load will fail if not found, but we'll fall back to empty
     let registry = match UserRegistry::load(&args.users_path) {
         Ok(r) => {
             info!("Loaded user registry from {}", args.users_path);
@@ -102,12 +103,22 @@ async fn main() {
         }
     };
 
-    let state = Arc::new(AppState::new(ollama_urls, args.timeout, registry, args.model_aliases_path.clone()).unwrap());
+    // Load model config (required, will crash if missing)
+    let log_buffer = log_buffer.unwrap_or_else(|| LogBuffer::new(100));
+    
+    let state = Arc::new(AppState::new(
+        args.model_config_path.clone(),
+        args.timeout,
+        registry,
+        args.debug,
+        log_buffer.clone(),
+        args.ip_header,
+    ).expect("Failed to load model configuration"));
 
-    // Reload the user registry on SIGHUP without restarting.
+    // Reload the user registry and model config on SIGHUP without restarting.
     let sighup_state = state.clone();
     let users_path = args.users_path.clone();
-    let aliases_path = args.model_aliases_path.clone();
+    let config_path = args.model_config_path.clone();
     tokio::spawn(async move {
         let mut sig = match signal(SignalKind::hangup()) {
             Ok(s) => s,
@@ -120,19 +131,20 @@ async fn main() {
             sig.recv().await;
             match UserRegistry::load(&users_path) {
                 Ok(new_registry) => {
-                    *sighup_state.user_registry.lock().unwrap() = Arc::new(new_registry);
+                    let new_registry_arc = Arc::new(new_registry.clone());
+                    *sighup_state.user_registry.lock().unwrap() = new_registry_arc.clone();
+                    *sighup_state.vip_user.lock().unwrap() = new_registry_arc.get_vip_users();
                     info!("User registry reloaded from {} via SIGHUP", users_path);
                 }
                 Err(e) => {
                     warn!("Failed to reload {} via SIGHUP: {}", users_path, e);
                 }
             }
-            if let Some(ref path) = aliases_path {
-                if let Err(e) = sighup_state.reload_model_aliases(path) {
-                    warn!("Failed to reload model aliases from {} via SIGHUP: {}", path, e);
-                } else {
-                    info!("Model aliases reloaded from {} via SIGHUP", path);
-                }
+            if let Err(e) = sighup_state.reload_model_config(&config_path) {
+                eprintln!("ERROR: Failed to reload model config from {}: {}", config_path, e);
+                eprintln!("Continuing with existing configuration");
+            } else {
+                info!("Model config reloaded from {} via SIGHUP", config_path);
             }
         }
     });
@@ -142,15 +154,14 @@ async fn main() {
         run_worker(worker_state).await;
     });
 
-    let mut app = Router::new()
+    let app = Router::new()
         .route("/health", get(|| async { "OK" }))
-        // Ollama API Endpoints (Explicitly listed)
         .route("/", any(proxy_handler))
         .route("/api/generate", any(proxy_handler))
         .route("/api/chat", any(proxy_handler))
         .route("/api/embed", any(proxy_handler))
         .route("/api/embeddings", any(proxy_handler))
-        .route("/api/tags", any(proxy_handler))
+        .route("/api/tags", get(tags_handler))
         .route("/api/show", any(proxy_handler))
         .route("/api/create", any(proxy_handler))
         .route("/api/copy", any(proxy_handler))
@@ -160,19 +171,11 @@ async fn main() {
         .route("/api/blobs/{digest}", any(proxy_handler))
         .route("/api/ps", any(proxy_handler))
         .route("/api/version", any(proxy_handler))
-        // OpenAI Compatible Endpoints
         .route("/v1/chat/completions", any(proxy_handler))
         .route("/v1/completions", any(proxy_handler))
         .route("/v1/embeddings", any(proxy_handler))
         .route("/v1/models", any(proxy_handler))
-        .route("/v1/models/{model}", any(proxy_handler));
-
-    // Optional fallback
-    if args.allow_all_routes {
-        app = app.fallback(proxy_handler);
-    }
-
-    let app = app
+        .route("/v1/models/{model}", any(proxy_handler))
         .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024 * 1024)) // 1GB limit
         .with_state(state.clone());
 

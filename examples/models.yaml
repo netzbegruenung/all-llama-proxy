@@ -1,0 +1,9 @@
+models:
+  - name: "gpt-oss:120b-ctx128k"
+    public_name: "my-gpt"
+    backends:
+      - http://10.137.1.1:11434
+      - http://10.137.1.2:11434
+    aliases:
+      - "gpt-oss"
+      - "gpt-oss:120b"

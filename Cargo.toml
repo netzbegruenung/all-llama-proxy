@@ -1,12 +1,12 @@
 [package]
-name = "ollamaMQ"
-version = "0.2.6"
+name = "all-llama-proxy"
+version = "0.3.0"
 edition = "2024"
 description = "High-performance Ollama proxy with per-user fair-share queuing, round-robin scheduling, and a real-time TUI dashboard."
 license = "MIT"
-authors = ["Chleba <chlebik@gmail.com>"]
-repository = "https://github.com/Chleba/ollamaMQ"
-homepage = "https://github.com/Chleba/ollamaMQ"
+authors = ["Sven Seeberg <mail@sven-seeberg.de>","Chleba <chlebik@gmail.com>"]
+repository = "https://github.com/netzbegruenung/all-llama-proxy"
+homepage = "https://github.com/netzbegruenung/all-llama-proxy"
 
 [dependencies]
 axum = "0.8.8"
@@ -15,7 +15,6 @@ reqwest = { version = "0.13.2", default-features = false, features = ["json", "s
 tokio = { version = "1.49.0", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tracing-appender = "0.2"
 ratatui = "0.29"
 crossterm = "0.28"
 tokio-stream = { version = "0.1.18", features = ["sync"] }
@@ -25,3 +24,4 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml = "0.9"
 sha2 = "0.10"
+humantime = "2.1"

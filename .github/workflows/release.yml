@@ -1,0 +1,14 @@
+name: Release Rust Binary
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: sudo apt install cargo
+      - run: git clone https://github.com/netzbegruenung/all-lama-proxy.git
+      - run: bash -c "cd all-lama-proxy; git checkout ${{ github.ref }}; bash .github/workflows/release.sh ${{ secrets.GITHUB_TOKEN }} ${{ github.ref }}"
