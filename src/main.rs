@@ -8,7 +8,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::Notify;
-use tracing::{info, warn, Level};
+use tracing::{info, Level, warn};
 use tracing_subscriber::EnvFilter;
 use std::fmt;
 
@@ -65,7 +65,7 @@ where
 {
     fn format_event(
         &self,
-        _cfg: &tracing_subscriber::fmt::FmtContext<'_, S, N>,
+        ctx: &tracing_subscriber::fmt::FmtContext<'_, S, N>,
         mut writer: tracing_subscriber::fmt::format::Writer<'_>,
         event: &tracing::Event<'_>,
     ) -> fmt::Result {
@@ -75,34 +75,12 @@ where
             Level::WARN => "WARN",
             Level::INFO => "INFO",
             Level::DEBUG => "DEBUG",
-            _ => "TRACE",
+            Level::TRACE => "TRACE",
         };
         
-        let mut visitor = CaptureFields::default();
-        event.record(&mut visitor);
-        
-        let message = visitor.message.unwrap_or_default();
-        
-        write!(writer, "{}: {}", level_str, message)
-    }
-}
-
-#[derive(Default)]
-struct CaptureFields {
-    message: Option<String>,
-}
-
-impl<'a> tracing::field::Visit for CaptureFields {
-    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn fmt::Debug) {
-        if field.name() == "message" {
-            self.message = Some(format!("{:?}", value));
-        }
-    }
-    
-    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-        if field.name() == "message" {
-            self.message = Some(value.to_string());
-        }
+        write!(writer, "{}: ", level_str)?;
+        ctx.field_format().format_fields(writer.by_ref(), event)?;
+        writeln!(writer)
     }
 }
 
@@ -123,10 +101,6 @@ async fn main() {
         tracing_subscriber::fmt()
             .with_writer(LogBufferWriter::new(log_buffer.clone()))
             .with_ansi(false)
-            .with_level(false)
-            .with_target(false)
-            .with_thread_ids(false)
-            .with_thread_names(false)
             .event_format(SimpleFormatter)
             .with_env_filter(EnvFilter::new(log_level))
             .init();
@@ -136,11 +110,7 @@ async fn main() {
         // Non-TUI mode: log to stdout with flat format
         tracing_subscriber::fmt()
             .with_writer(std::io::stdout)
-            .with_ansi(true)
-            .with_level(false)
-            .with_target(false)
-            .with_thread_ids(false)
-            .with_thread_names(false)
+            .with_ansi(false)
             .event_format(SimpleFormatter)
             .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(log_level)))
             .init();
