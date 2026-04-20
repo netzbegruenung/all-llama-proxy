@@ -68,7 +68,7 @@ Go to the [releases section](https://github.com/netzbegruenung/all-llama-proxy/r
 **Example:**
 
 ```bash
-all-llama-proxy --port 8080 --models-config-path ./example/models.yaml --users-path ./texample/users.yaml
+all-llama-proxy --bind 127.0.0.1:8080 --models-config-path ./example/models.yaml --users-path ./texample/users.yaml
 ```
 
 ### Add new User to `users.yaml`
