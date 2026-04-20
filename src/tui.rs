@@ -348,7 +348,7 @@ impl TuiDashboard {
         let total_dropped: usize = snapshot.dropped_counts.values().sum();
 
         let stats_line = vec![
-            Span::styled(" ollamaMQ ", Style::default().fg(Color::Cyan).bold()),
+            Span::styled(" all-llama-proxy ", Style::default().fg(Color::Cyan).bold()),
             Span::raw(" | "),
             Span::styled("Panel: ", Style::default().fg(Color::White)),
             Span::styled(if self.active_panel == Panel::Users { "USERS" } else { "BLOCKED" }, Style::default().fg(Color::Yellow).bold()),

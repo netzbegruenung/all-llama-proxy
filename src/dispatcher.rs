@@ -34,6 +34,64 @@ fn format_duration_short(d: std::time::Duration) -> String {
     }
 }
 
+/// Extract client IP from headers or fallback to connection address
+fn extract_client_ip(
+    headers: &HeaderMap,
+    addr: SocketAddr,
+    ip_header: &Option<String>,
+) -> IpAddr {
+    if let Some(header_name) = ip_header {
+        headers
+            .get(header_name)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.split(',').next().and_then(|ip| ip.trim().parse().ok()))
+            .unwrap_or_else(|| addr.ip())
+    } else {
+        addr.ip()
+    }
+}
+
+/// Authenticate request and return user ID if successful
+fn authenticate_request(
+    headers: &HeaderMap,
+    user_registry: &Mutex<Arc<UserRegistry>>,
+    ip: IpAddr,
+    is_debug: bool,
+) -> Option<String> {
+    let raw_token = match headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+    {
+        Some(token) => token,
+        None => {
+            if is_debug {
+                debug!("Rejected request from {}: missing or malformed Authorization header", ip);
+            } else {
+                warn!("Rejected request from {}: missing or malformed Authorization header", ip);
+            }
+            return None;
+        }
+    };
+
+    match user_registry.lock().unwrap().authenticate(raw_token) {
+        Some(uid) => {
+            if is_debug {
+                debug!("Authenticated user: {} from IP: {}", uid, ip);
+            }
+            Some(uid.to_string())
+        }
+        None => {
+            if is_debug {
+                debug!("Rejected request from {}: invalid token", ip);
+            } else {
+                warn!("Rejected request from {}: invalid token", ip);
+            }
+            None
+        }
+    }
+}
+
 /// Log entry for the in-TUI log buffer
 pub struct LogEntry {
     pub level: String,
@@ -421,6 +479,8 @@ pub struct AppState {
     pub ip_header: Option<String>,
     /// Cached /api/tags response with merged models
     pub cached_tags: Arc<RwLock<Option<CachedTags>>>,
+    /// Health check interval in seconds
+    pub health_check_interval: u64,
 }
 
 impl AppState {
@@ -431,6 +491,7 @@ impl AppState {
         debug: bool,
         log_buffer: LogBuffer,
         ip_header: Option<String>,
+        health_check_interval: u64,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let (blocked_ips, blocked_users) = Self::load_blocked_items();
         
@@ -492,6 +553,7 @@ impl AppState {
             log_buffer,
             ip_header,
             cached_tags: Arc::new(RwLock::new(None)),
+            health_check_interval,
         })
     }
     
@@ -829,29 +891,174 @@ async fn build_tags_cache(state: &AppState, client: &reqwest::Client) -> Result<
     Ok(())
 }
 
-pub async fn run_worker(state: Arc<AppState>) {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(state.timeout))
-        .build()
-        .unwrap();
-    let mut current_idx = 0;
+enum SelectionResult {
+    Dispatch(String, Task, usize, String),
+    ModelNotFound(Task, String),
+    Wait,
+}
 
-    // Background Health Check
-    let health_state = state.clone();
-    let health_client = client.clone();
+struct DispatchTaskArgs {
+    user_id: String,
+    task: Task,
+    backend_idx: usize,
+    backend_url: String,
+    state: Arc<AppState>,
+    client: reqwest::Client,
+}
+
+fn dispatch_task(args: DispatchTaskArgs) {
+    let DispatchTaskArgs { user_id, task, backend_idx, backend_url, state, client } = args;
+    let url = format!("{}{}", backend_url, task.path);
+
+    if state.debug {
+        debug!("Spawning task for user {} -> backend {} ({})",
+            user_id, backend_url, task.path);
+    }
+
+    tokio::spawn(async move {
+        let start = Instant::now();
+
+        let is_blocked = {
+            let user_ips = state.user_ips.lock().unwrap();
+            let blocked_ips = state.blocked_ips.lock().unwrap();
+            let blocked_users = state.blocked_users.lock().unwrap();
+            blocked_users.contains(&user_id) || user_ips.get(&user_id).map(|ip| blocked_ips.contains(ip)).unwrap_or(false)
+        };
+
+        if is_blocked || task.responder.is_closed() {
+            let mut dropped = state.dropped_counts.lock().unwrap();
+            *dropped.entry(user_id.clone()).or_insert(0) += 1;
+        } else {
+            {
+                let mut processing = state.processing_counts.lock().unwrap();
+                *processing.entry(user_id.clone()).or_insert(0) += 1;
+            }
+
+            if state.debug {
+                debug!("=== BACKEND REQUEST ===");
+                debug!("URL: {}", url);
+                debug!("Method: {:?}", task.method);
+                debug!("Headers: {:?}", task.headers);
+                if let Ok(body_str) = std::str::from_utf8(&task.body) {
+                    debug!("Body: {}", body_str);
+                } else {
+                    debug!("Body: <binary data> {} bytes", task.body.len());
+                }
+            }
+
+            let res_fut = client.request(task.method, &url)
+                .headers(task.headers)
+                .body(task.body)
+                .send();
+
+            match res_fut.await {
+                Ok(response) => {
+                    let status = response.status();
+
+                    if state.debug {
+                        debug!("Backend {} responded with status {} for user {}",
+                            backend_url, status, user_id);
+                    }
+
+                    let mut headers = response.headers().clone();
+                    headers.remove(axum::http::header::TRANSFER_ENCODING);
+                    headers.remove(axum::http::header::CONTENT_LENGTH);
+
+                    if task.responder.send(ResponsePart::Status(status, headers)).await.is_ok() {
+                        let mut stream = response.bytes_stream();
+                        let mut client_disconnected = false;
+                        while let Some(chunk_res) = stream.next().await {
+                            match chunk_res {
+                                Ok(chunk) => {
+                                    if task.responder.send(ResponsePart::Chunk(chunk)).await.is_err() {
+                                        client_disconnected = true;
+                                        break;
+                                    }
+                                }
+                                Err(_) => break,
+                            }
+                        }
+
+                        if !client_disconnected {
+                            let mut counts = state.processed_counts.lock().unwrap();
+                            *counts.entry(user_id.clone()).or_insert(0) += 1;
+
+                            // Log completion
+                            let model_info = task.resolved_model
+                                .as_ref()
+                                .map(|m| format!(" using {}", m))
+                                .unwrap_or_default();
+                            info!("Request finished for user {}{}, duration {}",
+                                user_id,
+                                model_info,
+                                format_duration_short(start.elapsed()));
+                        } else {
+                            let mut dropped = state.dropped_counts.lock().unwrap();
+                            *dropped.entry(user_id.clone()).or_insert(0) += 1;
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("Backend {} request failed for user {}: {}", backend_url, user_id, e);
+                    let _ = task.responder.send(ResponsePart::Error(e)).await;
+                    let mut dropped = state.dropped_counts.lock().unwrap();
+                    *dropped.entry(user_id.clone()).or_insert(0) += 1;
+
+                    // Log failure
+                    let model_info = task.resolved_model
+                        .as_ref()
+                        .map(|m| format!(" using {}", m))
+                        .unwrap_or_default();
+                    info!("Request failed for user {}{}, duration {}",
+                        user_id,
+                        model_info,
+                        format_duration_short(start.elapsed()));
+                }
+            }
+
+            {
+                let mut processing = state.processing_counts.lock().unwrap();
+                if let Some(count) = processing.get_mut(&user_id) { *count = count.saturating_sub(1); }
+            }
+        }
+
+        {
+            let mut backends = state.backends.lock().unwrap();
+            backends[backend_idx].active_requests = backends[backend_idx].active_requests.saturating_sub(1);
+            backends[backend_idx].processed_count += 1;
+        }
+        state.backend_freed.notify_one();
+    });
+}
+
+async fn handle_model_not_found(task: Task, model_name: String) {
+    warn!("No backend has model '{}', returning 503", model_name);
+    let error_body = Bytes::from(
+        serde_json::json!({"error": format!("Model '{}' not available on any backend", model_name)}).to_string()
+    );
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/json"),
+    );
+    let _ = task.responder.send(ResponsePart::Status(StatusCode::SERVICE_UNAVAILABLE, headers)).await;
+    let _ = task.responder.send(ResponsePart::Chunk(error_body)).await;
+}
+
+fn spawn_health_checker(state: Arc<AppState>, client: reqwest::Client) {
     tokio::spawn(async move {
         // Build initial cache
-        let _ = build_tags_cache(&health_state, &health_client).await;
+        let _ = build_tags_cache(&state, &client).await;
 
         loop {
             let backends_to_check: Vec<(usize, String)> = {
-                let backends = health_state.backends.lock().unwrap();
+                let backends = state.backends.lock().unwrap();
                 backends.iter().enumerate().map(|(i, b)| (i, b.url.clone())).collect()
             };
 
             for (idx, url) in backends_to_check {
                 let check_url = format!("{}/api/tags", url);
-                match health_client.get(&check_url).send().await {
+                match client.get(&check_url).send().await {
                     Ok(resp) => {
                         // Parse full model info from the response
                         let backend_models: Vec<BackendModelInfo> = resp
@@ -864,7 +1071,7 @@ pub async fn run_worker(state: Arc<AppState>) {
                                 .collect())
                             .unwrap_or_default();
 
-                        let mut backends = health_state.backends.lock().unwrap();
+                        let mut backends = state.backends.lock().unwrap();
                         let backend = &mut backends[idx];
                         
                         // Mark as online
@@ -905,7 +1112,7 @@ pub async fn run_worker(state: Arc<AppState>) {
                         }
                     }
                     Err(_) => {
-                        let mut backends = health_state.backends.lock().unwrap();
+                        let mut backends = state.backends.lock().unwrap();
                         let backend = &mut backends[idx];
                         
                         if backend.is_online {
@@ -923,335 +1130,211 @@ pub async fn run_worker(state: Arc<AppState>) {
             }
             
             // Build merged cache after checking all backends
-            let _ = build_tags_cache(&health_state, &health_client).await;
+            let _ = build_tags_cache(&state, &client).await;
             
-            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            tokio::time::sleep(std::time::Duration::from_secs(state.health_check_interval)).await;
         }
     });
+}
 
-    enum SelectionResult {
-        Dispatch(String, Task, usize, String),
-        ModelNotFound(Task, String),
-        Wait,
+fn select_and_prepare_task(state: &Arc<AppState>, current_idx: &mut usize) -> SelectionResult {
+    let mut queues = state.queues.lock().unwrap();
+    let mut backends = state.backends.lock().unwrap();
+    let mut last_idx = state.last_backend_idx.lock().unwrap();
+
+    // 1. Find all available online backends (Limit: 1 request per backend)
+    let online_indices: Vec<usize> = backends.iter()
+        .enumerate()
+        .filter(|(_, b)| b.is_online && b.active_requests < 1)
+        .map(|(i, _)| i)
+        .collect();
+
+    if online_indices.is_empty() {
+        return SelectionResult::Wait;
     }
 
-    loop {
-        let selection = {
-            let mut queues = state.queues.lock().unwrap();
-            let mut backends = state.backends.lock().unwrap();
-            let mut last_idx = state.last_backend_idx.lock().unwrap();
-            
-            // 1. Find all available online backends (Limit: 1 request per backend)
-            let online_indices: Vec<usize> = backends.iter()
-                .enumerate()
-                .filter(|(_, b)| b.is_online && b.active_requests < 1)
-                .map(|(i, _)| i)
+    let mut target_user = None;
+    let vip_list = state.vip_user.lock().unwrap().clone();
+    let boost = state.boost_user.lock().unwrap().clone();
+    let mut counter = state.global_counter.lock().unwrap();
+
+    let mut active_users: Vec<String> = queues.keys()
+        .filter(|u| !queues.get(*u).unwrap().is_empty())
+        .cloned()
+        .collect();
+
+    if active_users.is_empty() {
+        return SelectionResult::Wait;
+    }
+
+    active_users.sort_by(|a, b| {
+        let a_total = state.processed_counts.lock().unwrap().get(a).cloned().unwrap_or(0);
+        let b_total = state.processed_counts.lock().unwrap().get(b).cloned().unwrap_or(0);
+        a_total.cmp(&b_total).then_with(|| a.cmp(b))
+    });
+
+    // Priority: VIP users first (in order), then boost user, then round-robin
+    for vip_user in &vip_list {
+        if active_users.contains(vip_user) {
+            target_user = Some(vip_user.clone());
+            break;
+        }
+    }
+
+    if target_user.is_none() {
+        if let Some(ref b) = boost {
+            if active_users.contains(b) && *counter % 2 == 0 { target_user = Some(b.clone()); }
+        }
+    }
+
+    if target_user.is_none() {
+        if *current_idx >= active_users.len() { *current_idx = 0; }
+        target_user = Some(active_users[*current_idx].clone());
+        *current_idx += 1;
+    }
+
+    let user_id = match target_user {
+        Some(u) => u,
+        None => return SelectionResult::Wait,
+    };
+
+    // Peek at the task to get the model BEFORE popping
+    let task_body = queues.get(&user_id).unwrap().front().unwrap().body.clone();
+
+    let is_debug = state.debug;
+    let config = state.model_config.read().unwrap();
+
+    // Peek at the original requested model name
+    let requested_model = peek_model_from_body(&task_body);
+
+    // Resolve alias to get the real model name (for routing decisions)
+    let resolved_model = requested_model.clone()
+        .and_then(|model| {
+            if let Some(resolved) = config.resolve_alias(&model) {
+                Some(resolved)
+            } else if config.get_model(&model).is_some() {
+                Some(normalize_model_tag(&model))
+            } else {
+                None
+            }
+        })
+        .map(|m| normalize_model_tag(&m));
+
+    drop(config);
+
+    match resolved_model {
+        Some(model) => {
+            // Filter backends: can serve this model
+            let eligible: Vec<usize> = online_indices.iter().cloned()
+                .filter(|&i| backends[i].can_serve_model(&model))
                 .collect();
 
-            if online_indices.is_empty() {
+            if eligible.is_empty() {
+                // No eligible backend - wait, do NOT pop the task
+                if is_debug {
+                    debug!("No backend can serve model '{}' for user {}", model, user_id);
+                }
                 SelectionResult::Wait
             } else {
-                let mut target_user = None;
-                let vip_list = state.vip_user.lock().unwrap().clone();
-                let boost = state.boost_user.lock().unwrap().clone();
-                let mut counter = state.global_counter.lock().unwrap();
+                // NOW pop the task (backend is guaranteed available)
+                let mut task = queues.get_mut(&user_id).unwrap().pop_front().unwrap();
+                *counter += 1;
 
-                let mut active_users: Vec<String> = queues.keys()
-                    .filter(|u| !queues.get(*u).unwrap().is_empty())
-                    .cloned()
-                    .collect();
+                // Resolve alias in body (mutate the body)
+                let config = state.model_config.read().unwrap();
+                let resolved_model_name = extract_and_resolve_model(&mut task.body, &task.path, &config, is_debug);
 
-                if active_users.is_empty() {
-                    SelectionResult::Wait
-                } else {
-                    active_users.sort_by(|a, b| {
-                        let a_total = state.processed_counts.lock().unwrap().get(a).cloned().unwrap_or(0);
-                        let b_total = state.processed_counts.lock().unwrap().get(b).cloned().unwrap_or(0);
-                        a_total.cmp(&b_total).then_with(|| a.cmp(b))
-                    });
+                // Store resolved model in task and log if alias was used
+                if let Some(ref resolved) = resolved_model_name {
+                    task.resolved_model = Some(resolved.clone());
 
-                    // Priority: VIP users first (in order), then boost user, then round-robin
-                    for vip_user in &vip_list {
-                        if active_users.contains(vip_user) {
-                            target_user = Some(vip_user.clone());
-                            break;
-                        }
-                    }
+                    // Log alias rewrite if different from requested
+                    let orig_normalized = requested_model
+                        .as_ref()
+                        .map(|m| normalize_model_tag(m))
+                        .or_else(|| Some(resolved.clone()));
 
-                    if target_user.is_none() {
-                        if let Some(ref b) = boost {
-                            if active_users.contains(b) && *counter % 2 == 0 { target_user = Some(b.clone()); }
-                        }
-                    }
-
-                    if target_user.is_none() {
-                        if current_idx >= active_users.len() { current_idx = 0; }
-                        target_user = Some(active_users[current_idx].clone());
-                        current_idx += 1;
-                    }
-
-                    match target_user {
-                        Some(user_id) => {
-                            // Peek at the task to get the model BEFORE popping
-                            let task_body = queues.get(&user_id).unwrap().front().unwrap().body.clone();
-                            
-                            let is_debug = state.debug;
-                            let config = state.model_config.read().unwrap();
-                            
-                            // Peek at the original requested model name
-                            let requested_model = peek_model_from_body(&task_body);
-                            
-                            // Resolve alias to get the real model name (for routing decisions)
-                            let resolved_model = requested_model.clone()
-                                .and_then(|model| {
-                                    // Check if this is an alias that needs resolution
-                                    if let Some(resolved) = config.resolve_alias(&model) {
-                                        Some(resolved)
-                                    } else if config.get_model(&model).is_some() {
-                                        // Already a real model name, normalize it
-                                        Some(normalize_model_tag(&model))
-                                    } else {
-                                        // Not in config at all
-                                        None
-                                    }
-                                })
-                                .map(|m| normalize_model_tag(&m));
-
-                            drop(config);
-                            
-                            match resolved_model {
-                                Some(model) => {
-                                    // Filter backends: can serve this model
-                                    let eligible: Vec<usize> = online_indices.iter().cloned()
-                                        .filter(|&i| backends[i].can_serve_model(&model))
-                                        .collect();
-                                    
-                                    if eligible.is_empty() {
-                                        // No eligible backend - wait, do NOT pop the task
-                                        if is_debug {
-                                            debug!("No backend can serve model '{}' for user {}", model, user_id);
-                                        }
-                                        SelectionResult::Wait
-                                    } else {
-                                        // NOW pop the task (backend is guaranteed available)
-                                    let mut task = queues.get_mut(&user_id).unwrap().pop_front().unwrap();
-                                        *counter += 1;
-
-                                        // Resolve alias in body (mutate the body)
-                                        let task_body_ref = &mut task.body;
-                                        let config = state.model_config.read().unwrap();
-                                        let resolved_model_name = extract_and_resolve_model(task_body_ref, &task.path, &config, is_debug);
-                                        
-                                        // Store resolved model in task and log if alias was used
-                                        if let Some(ref resolved) = resolved_model_name {
-                                            task.resolved_model = Some(resolved.clone());
-                                            
-                                            // Log alias rewrite if different from requested
-                                            let orig_normalized = requested_model
-                                                .as_ref()
-                                                .map(|m| normalize_model_tag(m))
-                                                .or_else(|| Some(resolved.clone()));
-                                            
-                                            if orig_normalized.as_ref() != Some(resolved) {
-                                                info!("Mapped requested model {} to {} for user {}", 
-                                                    requested_model.as_deref().unwrap_or("unknown"),
-                                                    resolved,
-                                                    user_id); 
-                                            }
-                                        }
-                    
-                                        let selected_backend_idx = {
-                                            let min_conns = eligible.iter()
-                                                .map(|&i| backends[i].active_requests)
-                                                .min()
-                                                .unwrap();
-                                            let candidates: Vec<usize> = eligible.iter()
-                                                .cloned()
-                                                .filter(|&i| backends[i].active_requests == min_conns)
-                                                .collect();
-                                            let candidate_pos = candidates.iter()
-                                                .position(|&i| i > *last_idx)
-                                                .unwrap_or(0);
-                                            let selected = candidates[candidate_pos];
-                                            *last_idx = selected;
-                                            selected
-                                        };
-                        
-                                        if is_debug {
-                                            debug!("Selected backend {} (idx {}) for user {}, model {}", 
-                                                backends[selected_backend_idx].url, 
-                                                selected_backend_idx, 
-                                                user_id, 
-                                                model
-                                            );
-                                        }
-                        
-                                        backends[selected_backend_idx].active_requests += 1;
-                                        SelectionResult::Dispatch(
-                                            user_id,
-                                            task,
-                                            selected_backend_idx,
-                                            backends[selected_backend_idx].url.clone()
-                                        )
-                                    }
-                                }
-                                None => {
-                                    // Model not in config - pop and fail
-                                    let task = queues.get_mut(&user_id).unwrap().pop_front().unwrap();
-                                    *counter += 1;
-                                    
-                                    if is_debug {
-                                        debug!("Model not in config for user {}", user_id);
-                                    }
-                                    
-                                    SelectionResult::ModelNotFound(task, 
-                                        requested_model.unwrap_or("unknown".to_string()))
-                                }
-                            }
-                        }
-                        None => SelectionResult::Wait,
+                    if orig_normalized.as_ref() != Some(resolved) {
+                        info!("Mapped requested model {} to {} for user {}",
+                            requested_model.as_deref().unwrap_or("unknown"),
+                            resolved,
+                            user_id);
                     }
                 }
+
+                let selected_backend_idx = {
+                    let min_conns = eligible.iter()
+                        .map(|&i| backends[i].active_requests)
+                        .min()
+                        .unwrap();
+                    let candidates: Vec<usize> = eligible.iter()
+                        .cloned()
+                        .filter(|&i| backends[i].active_requests == min_conns)
+                        .collect();
+                    let candidate_pos = candidates.iter()
+                        .position(|&i| i > *last_idx)
+                        .unwrap_or(0);
+                    let selected = candidates[candidate_pos];
+                    *last_idx = selected;
+                    selected
+                };
+
+                if is_debug {
+                    debug!("Selected backend {} (idx {}) for user {}, model {}",
+                        backends[selected_backend_idx].url,
+                        selected_backend_idx,
+                        user_id,
+                        model
+                    );
+                }
+
+                backends[selected_backend_idx].active_requests += 1;
+                SelectionResult::Dispatch(
+                    user_id,
+                    task,
+                    selected_backend_idx,
+                    backends[selected_backend_idx].url.clone()
+                )
             }
-        };
+        }
+        None => {
+            // Model not in config - pop and fail
+            let task = queues.get_mut(&user_id).unwrap().pop_front().unwrap();
+            *counter += 1;
+
+            if is_debug {
+                debug!("Model not in config for user {}", user_id);
+            }
+
+            SelectionResult::ModelNotFound(task, requested_model.unwrap_or("unknown".to_string()))
+        }
+    }
+}
+
+pub async fn run_worker(state: Arc<AppState>) {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(state.timeout))
+        .build()
+        .unwrap();
+    let mut current_idx = 0;
+
+    spawn_health_checker(state.clone(), client.clone());
+
+    loop {
+        let selection = select_and_prepare_task(&state, &mut current_idx);
 
         match selection {
             SelectionResult::ModelNotFound(task, model_name) => {
-                warn!("No backend has model '{}', returning 503", model_name);
-                let error_body = Bytes::from(
-                    serde_json::json!({"error": format!("Model '{}' not available on any backend", model_name)}).to_string()
-                );
-                let mut headers = HeaderMap::new();
-                headers.insert(
-                    axum::http::header::CONTENT_TYPE,
-                    axum::http::HeaderValue::from_static("application/json"),
-                );
-                let _ = task.responder.send(ResponsePart::Status(StatusCode::SERVICE_UNAVAILABLE, headers)).await;
-                let _ = task.responder.send(ResponsePart::Chunk(error_body)).await;
+                handle_model_not_found(task, model_name).await;
             }
             SelectionResult::Dispatch(user_id, task, backend_idx, backend_url) => {
-                let state_clone = state.clone();
-                let client_clone = client.clone();
-                let url = format!("{}{}", backend_url, task.path);
-
-                if state.debug {
-                    debug!("Spawning task for user {} -> backend {} ({})", 
-                        user_id, backend_url, task.path);
-                }
-
-                tokio::spawn(async move {
-                    let start = Instant::now();
-                    
-                    let is_blocked = {
-                        let user_ips = state_clone.user_ips.lock().unwrap();
-                        let blocked_ips = state_clone.blocked_ips.lock().unwrap();
-                        let blocked_users = state_clone.blocked_users.lock().unwrap();
-                        blocked_users.contains(&user_id) || user_ips.get(&user_id).map(|ip| blocked_ips.contains(ip)).unwrap_or(false)
-                    };
-
-                    if is_blocked || task.responder.is_closed() {
-                        let mut dropped = state_clone.dropped_counts.lock().unwrap();
-                        *dropped.entry(user_id.clone()).or_insert(0) += 1;
-                    } else {
-                        {
-                            let mut processing = state_clone.processing_counts.lock().unwrap();
-                            *processing.entry(user_id.clone()).or_insert(0) += 1;
-                        }
-
-                        if state_clone.debug {
-                            debug!("=== BACKEND REQUEST ===");
-                            debug!("URL: {}", url);
-                            debug!("Method: {:?}", task.method);
-                            debug!("Headers: {:?}", task.headers);
-                            if let Ok(body_str) = std::str::from_utf8(&task.body) {
-                                debug!("Body: {}", body_str);
-                            } else {
-                                debug!("Body: <binary data> {} bytes", task.body.len());
-                            }
-                        }
-
-                        let res_fut = client_clone.request(task.method, &url)
-                            .headers(task.headers)
-                            .body(task.body)
-                            .send();
-
-                        match res_fut.await {
-                            Ok(response) => {
-                                let status = response.status();
-                                
-                                if state_clone.debug {
-                                    debug!("Backend {} responded with status {} for user {}", 
-                                        backend_url, status, user_id);
-                                }
-                                
-                                let mut headers = response.headers().clone();
-                                headers.remove(axum::http::header::TRANSFER_ENCODING);
-                                headers.remove(axum::http::header::CONTENT_LENGTH);
-
-                                if task.responder.send(ResponsePart::Status(status, headers)).await.is_ok() {
-                                    let mut stream = response.bytes_stream();
-                                    let mut client_disconnected = false;
-                                    while let Some(chunk_res) = stream.next().await {
-                                        match chunk_res {
-                                            Ok(chunk) => {
-                                                if task.responder.send(ResponsePart::Chunk(chunk)).await.is_err() {
-                                                    client_disconnected = true;
-                                                    break;
-                                                }
-                                            }
-                                            Err(_) => break,
-                                        }
-                                    }
-
-                                    if !client_disconnected {
-                                        let mut counts = state_clone.processed_counts.lock().unwrap();
-                                        *counts.entry(user_id.clone()).or_insert(0) += 1;
-                    
-                                        // Log completion
-                                        let model_info = task.resolved_model
-                                            .as_ref()
-                                            .map(|m| format!(" using {}", m))
-                                            .unwrap_or_default();
-                                        info!("Request finished for user {}{}, duration {}", 
-                                            user_id,
-                                            model_info,
-                                            format_duration_short(start.elapsed()));
-                                    } else {
-                                        let mut dropped = state_clone.dropped_counts.lock().unwrap();
-                                        *dropped.entry(user_id.clone()).or_insert(0) += 1;
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                error!("Backend {} request failed for user {}: {}", backend_url, user_id, e);
-                                let _ = task.responder.send(ResponsePart::Error(e)).await;
-                                let mut dropped = state_clone.dropped_counts.lock().unwrap();
-                                *dropped.entry(user_id.clone()).or_insert(0) += 1;
-                                
-                                // Log failure
-                                let model_info = task.resolved_model
-                                    .as_ref()
-                                    .map(|m| format!(" using {}", m))
-                                    .unwrap_or_default();
-                                info!("Request failed for user {}{}, duration {}", 
-                                    user_id,
-                                    model_info,
-                                    format_duration_short(start.elapsed()));
-                            }
-                        }
-
-                        {
-                            let mut processing = state_clone.processing_counts.lock().unwrap();
-                            if let Some(count) = processing.get_mut(&user_id) { *count = count.saturating_sub(1); }
-                        }
-                    }
-
-                    {
-                        let mut backends = state_clone.backends.lock().unwrap();
-                        backends[backend_idx].active_requests = backends[backend_idx].active_requests.saturating_sub(1);
-                        backends[backend_idx].processed_count += 1;
-                    }
-                    state_clone.backend_freed.notify_one();
+                dispatch_task(DispatchTaskArgs {
+                    user_id,
+                    task,
+                    backend_idx,
+                    backend_url,
+                    state: state.clone(),
+                    client: client.clone(),
                 });
             }
             SelectionResult::Wait => {
@@ -1273,53 +1356,13 @@ pub async fn proxy_handler(
     body: Bytes,
 ) -> impl IntoResponse {
     let path = uri.path().to_string();
-    let ip = if let Some(header_name) = &state.ip_header {
-        headers
-            .get(header_name)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.split(',').next().and_then(|ip| ip.trim().parse().ok()))
-            .unwrap_or_else(|| addr.ip())
-    } else {
-        addr.ip()
-    };
+    let ip = extract_client_ip(&headers, addr, &state.ip_header);
     let is_debug = state.debug;
 
     // --- Authentication ---
-    // Extract and validate the Bearer token from the Authorization header.
-    let raw_token = match headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-    {
-        Some(token) => token.to_string(),
-        None => {
-            if is_debug { 
-                debug!("Rejected request from {}: missing or malformed Authorization header", ip);
-            } else {
-                warn!("Rejected request from {}: missing or malformed Authorization header", ip);
-            }
-            return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
-        }
-    };
-
-    let user_id = {
-        let registry = state.user_registry.lock().unwrap().clone();
-        match registry.authenticate(&raw_token) {
-            Some(uid) => {
-                if is_debug {
-                    debug!("Authenticated user: {} from IP: {}", uid, ip);
-                }
-                uid.to_string()
-            }
-            None => {
-                if is_debug { 
-                    debug!("Rejected request from {}: invalid token", ip);
-                } else {
-                    warn!("Rejected request from {}: invalid token", ip);
-                }
-                return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
-            }
-        }
+    let user_id = match authenticate_request(&headers, &state.user_registry, ip, is_debug) {
+        Some(uid) => uid,
+        None => return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response(),
     };
 
     if is_debug {
@@ -1414,28 +1457,11 @@ pub async fn tags_handler(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     // Extract IP
-    let ip = if let Some(header_name) = &state.ip_header {
-        headers
-            .get(header_name)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.split(',').next().and_then(|ip| ip.trim().parse().ok()))
-            .unwrap_or_else(|| addr.ip())
-    } else {
-        addr.ip()
-    };
+    let ip = extract_client_ip(&headers, addr, &state.ip_header);
 
     // Authentication
-    let raw_token = match headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-    {
-        Some(token) => token.to_string(),
-        None => return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response(),
-    };
-
-    let user_id = match state.user_registry.lock().unwrap().authenticate(&raw_token) {
-        Some(uid) => uid.to_string(),
+    let user_id = match authenticate_request(&headers, &state.user_registry, ip, true) {
+        Some(uid) => uid,
         None => return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response(),
     };
 
@@ -1490,17 +1516,19 @@ struct HealthResponse {
 }
 
 pub async fn health_handler(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
-    let raw_token = match headers
+    // Simple authentication - no IP tracking, minimal logging
+    let valid = match headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
     {
-        Some(token) => token.to_string(),
-        None => return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response(),
+        Some(token) => {
+            state.user_registry.lock().unwrap().authenticate(token).is_some()
+        }
+        None => false,
     };
 
-    let registry = state.user_registry.lock().unwrap();
-    if registry.authenticate(&raw_token).is_none() {
+    if !valid {
         return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
     }
 

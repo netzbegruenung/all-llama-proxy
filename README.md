@@ -2,7 +2,7 @@
 
 `all-lama-proxy` is a high-performance, asynchronous message queue dispatcher and load balancer designed to sit in front of one or more [Ollama](https://ollama.ai/) API instances. It acts as a smart proxy that queues incoming requests from multiple users and dispatches them in parallel to multiple Ollama backends using a fair-share round-robin scheduler with least-connections load balancing.
 
-`all-lama-proxy` is a fork of the awesome [`all-llama-proxy`](https://github.com/Chleba/all-llama-proxy) project. This project adds authentication and replaces Docker with a systemd service as the intended deployment method.
+`all-lama-proxy` is a fork of the awesome [`ollamaMQ`](https://github.com/Chleba/ollamaMQ) project. This project adds authentication and replaces Docker with a systemd service as the intended deployment method.
 
 ![Rust](https://img.shields.io/badge/rust-2024-orange.svg)
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
@@ -122,6 +122,7 @@ Point your LLM clients to the `all-llama-proxy` port (`11435`) and include the `
 
 ```bash
 curl -X POST http://localhost:11435/api/chat \
+  -H "Authorization: Bearer SECRET" \
   -H "X-User-ID: developer-1" \
   -d '{
     "model": "qwen3.5:35b",

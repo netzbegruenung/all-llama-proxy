@@ -145,6 +145,7 @@ async fn main() {
         args.debug,
         log_buffer.clone(),
         args.ip_header,
+        10,
     ).expect("Failed to load model configuration"));
 
     // Reload the user registry and model config on SIGHUP without restarting.
