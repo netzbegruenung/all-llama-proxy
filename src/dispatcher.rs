@@ -1,6 +1,6 @@
 use axum::{
     body::{Body, Bytes},
-    extract::{ConnectInfo, State},
+    extract::{ConnectInfo, State, Path},
     http::{HeaderMap, Method, StatusCode},
     response::IntoResponse,
 };
@@ -171,6 +171,21 @@ struct ModelsResponse {
 #[allow(dead_code)]
 struct ModelInfo {
     name: String,
+}
+
+/// OpenAI-compatible model response structure
+#[derive(Serialize)]
+pub(crate) struct OpenAIModel {
+    pub(crate) id: String,
+    pub(crate) object: &'static str,
+    pub(crate) created: i64,
+    pub(crate) owned_by: String,
+}
+
+#[derive(Serialize)]
+pub(crate) struct OpenAIModelsList {
+    pub(crate) object: &'static str,
+    pub(crate) data: Vec<OpenAIModel>,
 }
 
 // Full model info from backend /api/tags response
@@ -583,15 +598,27 @@ impl AppState {
     }
 }
 
+/// Normalize proxy paths to Ollama's API paths
+/// Maps `/chat/completions` → `/v1/chat/completions` for backend compatibility
+fn normalize_path(path: &str) -> &str {
+    match path {
+        "/chat/completions" => "/v1/chat/completions",
+        _ => path,
+    }
+}
+
 /// Paths that carry a `model` field in their JSON body.
 const MODEL_PATHS: &[&str] = &[
     "/api/generate",
     "/api/chat",
     "/api/embed",
     "/api/embeddings",
+    "/chat/completions",
     "/v1/chat/completions",
     "/v1/completions",
     "/v1/embeddings",
+    "/v1/responses",
+    "/v1/images/generations",
 ];
 
 /// Extract and resolve the `model` field from the request body when the path is model-aware.
@@ -659,6 +686,83 @@ fn normalize_model_tag(name: &str) -> String {
     } else {
         format!("{}:latest", name)
     }
+}
+
+/// Parse Unix timestamp from Ollama modified_at format or return current time
+fn parse_created_timestamp(modified_at: &str) -> i64 {
+    // Try to parse ISO 8601 format from Ollama
+    // Modified_at typically looks like: "2024-01-15T10:30:00Z" or similar
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(modified_at) {
+        dt.timestamp()
+    } else if let Ok(dt) = chrono::DateTime::parse_from_str(modified_at, "%Y-%m-%d %H:%M:%S.%f%#z") {
+        dt.timestamp()
+    } else {
+        // Fallback to current time if parsing fails
+        chrono::Utc::now().timestamp()
+    }
+}
+
+/// Transform cached tags into OpenAI-compatible models list
+fn build_models_list(cached_tags: &Option<CachedTags>) -> OpenAIModelsList {
+    let models = match cached_tags {
+        Some(tags) => tags.models.iter().map(|model| {
+            let created = parse_created_timestamp(&model.modified_at);
+            
+            OpenAIModel {
+                id: model.name.clone(),
+                object: "model",
+                created,
+                owned_by: "all-llama-proxy".to_string(),
+            }
+        }).collect(),
+        None => vec![],
+    };
+    
+    OpenAIModelsList {
+        object: "list",
+        data: models,
+    }
+}
+
+/// Find a single model by name (matches public_name, name, or alias)
+fn find_model_by_name(state: &AppState, requested_model: &str) -> Option<OpenAIModel> {
+    let cached_tags = state.cached_tags.read().unwrap();
+    
+    // First, try to find in cache by name
+    let model_info = cached_tags.as_ref().and_then(|tags| {
+        tags.models.iter().find(|m| {
+            m.name == requested_model || m.name == format!("{}:latest", requested_model)
+        })
+    });
+    
+    if let Some(model) = model_info {
+        let created = parse_created_timestamp(&model.modified_at);
+        return Some(OpenAIModel {
+            id: model.name.clone(),
+            object: "model",
+            created,
+            owned_by: "all-llama-proxy".to_string(),
+        });
+    }
+    
+    // Also check if it's an alias that resolves to a real model
+    let config = state.model_config.read().unwrap();
+    if let Some(real_model) = config.resolve_alias(requested_model) {
+        // Find the real model in cache
+        if let Some(real_model_info) = cached_tags.as_ref().and_then(|tags| {
+            tags.models.iter().find(|m| m.name == real_model)
+        }) {
+            let created = parse_created_timestamp(&real_model_info.modified_at);
+            return Some(OpenAIModel {
+                id: real_model_info.name.clone(),
+                object: "model",
+                created,
+                owned_by: "all-llama-proxy".to_string(),
+            });
+        }
+    }
+    
+    None
 }
 
 /// Build merged /api/tags cache from all configured models using their first backends
@@ -1248,8 +1352,10 @@ pub async fn proxy_handler(
     task_headers.remove(axum::http::header::AUTHORIZATION);
     task_headers.remove(axum::http::header::CONTENT_LENGTH);
 
+    let normalized_path = normalize_path(&path);
+
     let task = Task {
-        path,
+        path: normalized_path.to_string(),
         method,
         headers: task_headers,
         responder: tx,
@@ -1348,5 +1454,32 @@ pub async fn tags_handler(
     match cache.as_ref() {
         Some(cached_tags) => (StatusCode::OK, axum::Json(cached_tags.clone())).into_response(),
         None => (StatusCode::OK, axum::Json(serde_json::json!({"models": []}))).into_response(),
+    }
+}
+
+/// OpenAI-compatible models list handler
+pub async fn models_handler(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    let models_list = build_models_list(&state.cached_tags.read().unwrap());
+    (StatusCode::OK, axum::Json(models_list)).into_response()
+}
+
+/// OpenAI-compatible single model handler
+pub async fn model_handler(
+    State(state): State<Arc<AppState>>,
+    Path(model_name): Path<String>,
+) -> impl IntoResponse {
+    match find_model_by_name(&state, &model_name) {
+        Some(model) => (StatusCode::OK, axum::Json(model)).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            axum::Json(serde_json::json!({
+                "error": {
+                    "code": "model_not_found",
+                    "message": format!("Model '{}' not found", model_name)
+                }
+            }))
+        ).into_response(),
     }
 }

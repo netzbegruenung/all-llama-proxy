@@ -16,7 +16,7 @@ mod dispatcher;
 mod tui;
 
 use crate::auth::UserRegistry;
-use crate::dispatcher::{AppState, LogBuffer, LogBufferWriter, proxy_handler, tags_handler, run_worker};
+use crate::dispatcher::{AppState, LogBuffer, LogBufferWriter, proxy_handler, tags_handler, run_worker, models_handler, model_handler};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -171,11 +171,16 @@ async fn main() {
         .route("/api/blobs/{digest}", any(proxy_handler))
         .route("/api/ps", any(proxy_handler))
         .route("/api/version", any(proxy_handler))
+        .route("/chat/completions", any(proxy_handler))
         .route("/v1/chat/completions", any(proxy_handler))
         .route("/v1/completions", any(proxy_handler))
         .route("/v1/embeddings", any(proxy_handler))
-        .route("/v1/models", any(proxy_handler))
-        .route("/v1/models/{model}", any(proxy_handler))
+        .route("/v1/responses", any(proxy_handler))
+        .route("/v1/images/generations", any(proxy_handler))
+        .route("/models", get(models_handler))
+        .route("/v1/models", get(models_handler))
+        .route("/models/{model_name}", get(model_handler))
+        .route("/v1/models/{model_name}", get(model_handler))
         .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024 * 1024)) // 1GB limit
         .with_state(state.clone());
 
