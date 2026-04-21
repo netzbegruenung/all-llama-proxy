@@ -143,6 +143,7 @@ impl LogBuffer {
 pub struct LogBufferWriter {
     buffer: LogBuffer,
     current_line: String,
+    out: std::io::Stdout,
 }
 
 impl LogBufferWriter {
@@ -150,6 +151,7 @@ impl LogBufferWriter {
         Self {
             buffer,
             current_line: String::new(),
+            out: std::io::stdout(),
         }
     }
 
@@ -173,6 +175,9 @@ impl LogBufferWriter {
 
 impl Write for LogBufferWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let _ = self.out.write_all(buf);
+        let _ = self.out.flush();
+        
         if let Ok(line) = std::str::from_utf8(buf) {
             self.current_line.push_str(line);
             
@@ -189,6 +194,8 @@ impl Write for LogBufferWriter {
     }
 
     fn flush(&mut self) -> io::Result<()> {
+        let _ = self.out.flush();
+        
         // Process any remaining line on flush
         if !self.current_line.is_empty() {
             let complete_line = self.current_line.trim().to_string();
@@ -209,12 +216,13 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBufferWriter {
         LogBufferWriter {
             buffer: self.buffer.clone(),
             current_line: String::new(),
+            out: std::io::stdout(),
         }
     }
 }
 
 #[derive(Serialize, Deserialize, Default)]
-struct BlockedConfig {
+pub struct BlockedConfig {
     ips: HashSet<IpAddr>,
     users: HashSet<String>,
 }
@@ -233,17 +241,17 @@ struct ModelInfo {
 
 /// OpenAI-compatible model response structure
 #[derive(Serialize)]
-pub(crate) struct OpenAIModel {
-    pub(crate) id: String,
-    pub(crate) object: &'static str,
-    pub(crate) created: i64,
-    pub(crate) owned_by: String,
+pub struct OpenAIModel {
+    pub id: String,
+    pub object: &'static str,
+    pub created: i64,
+    pub owned_by: String,
 }
 
 #[derive(Serialize)]
-pub(crate) struct OpenAIModelsList {
-    pub(crate) object: &'static str,
-    pub(crate) data: Vec<OpenAIModel>,
+pub struct OpenAIModelsList {
+    pub object: &'static str,
+    pub data: Vec<OpenAIModel>,
 }
 
 // Full model info from backend /api/tags response
@@ -259,30 +267,30 @@ struct BackendModelInfo {
 }
 
 #[derive(Deserialize, Serialize, Clone)]
-pub(crate) struct ModelDetails {
-    pub(crate) parent_model: String,
-    pub(crate) format: String,
-    pub(crate) family: String,
-    pub(crate) families: Vec<String>,
-    pub(crate) parameter_size: String,
-    pub(crate) quantization_level: String,
+pub struct ModelDetails {
+    pub parent_model: String,
+    pub format: String,
+    pub family: String,
+    pub families: Vec<String>,
+    pub parameter_size: String,
+    pub quantization_level: String,
 }
 
 // Public-facing model info with public_name substitution
 #[derive(Serialize, Clone)]
-pub(crate) struct PublicModelInfo {
-    pub(crate) name: String,
-    pub(crate) model: String,
-    pub(crate) modified_at: String,
-    pub(crate) size: u64,
-    pub(crate) digest: String,
-    pub(crate) details: ModelDetails,
+pub struct PublicModelInfo {
+    pub name: String,
+    pub model: String,
+    pub modified_at: String,
+    pub size: u64,
+    pub digest: String,
+    pub details: ModelDetails,
 }
 
 // Cached tags response
 #[derive(Clone, Serialize)]
-pub(crate) struct CachedTags {
-    pub(crate) models: Vec<PublicModelInfo>,
+pub struct CachedTags {
+    pub models: Vec<PublicModelInfo>,
 }
 
 /// Loaded from models.yaml - explicit model-to-backend mapping

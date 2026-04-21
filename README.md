@@ -58,18 +58,19 @@ Go to the [releases section](https://github.com/netzbegruenung/all-llama-proxy/r
 - `--users-path`: path to the users config file (default: `/etc/all-llama-proxy/users.yaml`)
 - `--bind <INTERFACE:PORT>`: Interface and port to listen on (default: `127.0.0.1:11435`)
 - `-t, --timeout <SECONDS>`: Request timeout in seconds (default: `300`)
-- `--tui`: Use the interactive TUI dashboard
 - `--allow-all-routes`: Enable fallback proxy for non-standard endpoints
+- `-i, --ip-header`: trusted source IP header, useful behind proxy for TLS offloading
 - `-h, --help`: Print help message
 - `-V, --version`: Print version information
 - `--debug`: print debug messages to log file
-- `-i, --ip-header`: trusted source IP header, useful behind proxy for TLS offloading
 
 **Example:**
 
 ```bash
 all-llama-proxy --bind 127.0.0.1:8080 --models-config-path ./example/models.yaml --users-path ./texample/users.yaml
 ```
+
+To start the TUI, execute `all-llama-tui`.
 
 ### Add new User to `users.yaml`
 

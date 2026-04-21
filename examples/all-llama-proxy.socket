@@ -1,0 +1,12 @@
+[Unit]
+Description=All-Llama-Proxy for load balancing requests to Ollama servers
+After=network.target
+
+[Socket]
+ListenStream=/run/all-llama-proxy.sock
+SocketUser=www-data
+SocketGroup=www-data
+SocketMode=0660
+
+[Install]
+WantedBy=sockets.target

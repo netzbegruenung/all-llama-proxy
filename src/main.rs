@@ -1,59 +1,43 @@
+use all_llama_proxy::{
+    DashboardServer, UserRegistry, AppState, LogBuffer, LogBufferWriter,
+    proxy_handler, tags_handler, models_handler, model_handler, health_handler, run_worker,
+};
 use axum::{
     Router,
     routing::{any, get},
 };
 use clap::Parser;
-use std::io::IsTerminal;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::signal::unix::{signal, SignalKind};
-use tokio::sync::Notify;
-use tracing::{info, Level, warn};
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 use std::fmt;
-
-mod auth;
-mod dispatcher;
-mod tui;
-
-use crate::auth::UserRegistry;
-use crate::dispatcher::{AppState, LogBuffer, LogBufferWriter, proxy_handler, tags_handler, run_worker, models_handler, model_handler, health_handler};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Address to bind to (e.g., 127.0.0.1:11435, 0.0.0.0:8080, or [::1]:11435)
     #[arg(long, default_value = "127.0.0.1:11435")]
     bind: String,
 
-    /// Request timeout in seconds
     #[arg(short, long, default_value_t = 300)]
     timeout: u64,
 
-    /// Enable TUI dashboard
-    #[arg(long)]
-    tui: bool,
+    #[arg(long, default_value = "/run/all-llama-proxy.sock")]
+    dashboard_socket: String,
 
-    /// Path to users.yaml file for authentication
     #[arg(long, default_value = "/etc/all-llama-proxy/users.yaml")]
     users_path: String,
 
-    /// Path to models.yaml file (required - backends come from here)
     #[arg(long, default_value = "/etc/all-llama-proxy/models.yaml")]
     model_config_path: String,
 
-    /// Enable verbose debug logging
     #[arg(long)]
     debug: bool,
 
-    /// HTTP header to extract real client IP from (e.g., X-Real-IP, X-Forwarded-For)
     #[arg(short = 'i', long = "ip-header")]
     ip_header: Option<String>,
-}
-
-struct TuiState {
-    visible: bool,
-    toggle_notify: Arc<Notify>,
 }
 
 struct SimpleFormatter;
@@ -71,13 +55,13 @@ where
     ) -> fmt::Result {
         let level = event.metadata().level();
         let level_str = match *level {
-            Level::ERROR => "ERROR",
-            Level::WARN => "WARN",
-            Level::INFO => "INFO",
-            Level::DEBUG => "DEBUG",
-            Level::TRACE => "TRACE",
+            tracing::Level::ERROR => "ERROR",
+            tracing::Level::WARN => "WARN",
+            tracing::Level::INFO => "INFO",
+            tracing::Level::DEBUG => "DEBUG",
+            tracing::Level::TRACE => "TRACE",
         };
-        
+
         write!(writer, "{}: ", level_str)?;
         ctx.field_format().format_fields(writer.by_ref(), event)?;
         writeln!(writer)
@@ -88,42 +72,24 @@ where
 async fn main() {
     let args = Args::parse();
 
-    // Validate bind address early
     let addr = args.bind.parse::<SocketAddr>()
         .expect("Invalid bind address. Use format like 127.0.0.1:11435, 0.0.0.0:8080, or [::1]:11435");
 
-    // Determine if we should run TUI
-    let use_tui = args.tui && std::io::stdout().is_terminal();
-
-    // Configure logging based on TUI mode
     let log_level = if args.debug { "debug" } else { "info" };
 
-    let log_buffer = if use_tui {
-        // TUI mode: create shared log buffer, log to stderr (won't corrupt TUI stdout)
+    let log_buffer = {
         let log_buffer = LogBuffer::new(100);
-        
+
         tracing_subscriber::fmt()
             .with_writer(LogBufferWriter::new(log_buffer.clone()))
             .with_ansi(false)
             .event_format(SimpleFormatter)
             .with_env_filter(EnvFilter::new(log_level))
             .init();
-        
-        Some(log_buffer)
-    } else {
-        // Non-TUI mode: log to stdout with flat format
-        tracing_subscriber::fmt()
-            .with_writer(std::io::stdout)
-            .with_ansi(false)
-            .event_format(SimpleFormatter)
-            .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(log_level)))
-            .init();
-        
-        None
+
+        log_buffer
     };
 
-    // Load user registry from CLI-specified path.
-    // Load will fail if not found, but we'll fall back to empty
     let registry = match UserRegistry::load(&args.users_path) {
         Ok(r) => {
             info!("Loaded user registry from {}", args.users_path);
@@ -135,20 +101,17 @@ async fn main() {
         }
     };
 
-    // Load model config (required, will crash if missing)
-    let log_buffer = log_buffer.unwrap_or_else(|| LogBuffer::new(100));
-    
+    let log_buffer_clone = log_buffer.clone();
     let state = Arc::new(AppState::new(
         args.model_config_path.clone(),
         args.timeout,
         registry,
         args.debug,
-        log_buffer.clone(),
+        log_buffer_clone,
         args.ip_header,
         10,
     ).expect("Failed to load model configuration"));
 
-    // Reload the user registry and model config on SIGHUP without restarting.
     let sighup_state = state.clone();
     let users_path = args.users_path.clone();
     let config_path = args.model_config_path.clone();
@@ -214,64 +177,42 @@ async fn main() {
         .route("/v1/models", get(models_handler))
         .route("/models/{model_name}", get(model_handler))
         .route("/v1/models/{model_name}", get(model_handler))
-        .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024 * 1024)) // 1GB limit
+        .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024 * 1024))
         .with_state(state.clone());
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     info!("Dispatcher running on http://{}", addr);
 
-    if use_tui {
-        let tui_state = Arc::new(Mutex::new(TuiState {
-            visible: true,
-            toggle_notify: Arc::new(Notify::new()),
-        }));
-
+    if let Ok(Some(dashboard_server)) = DashboardServer::from_systemd() {
+        let dashboard_state = state.clone();
         tokio::spawn(async move {
-            axum::serve(
-                listener,
-                app.into_make_service_with_connect_info::<SocketAddr>(),
-            )
-            .await
-            .unwrap();
+            if let Err(e) = dashboard_server.serve(dashboard_state).await {
+                eprintln!("Dashboard server error: {}", e);
+            }
         });
-
-        // Run TUI on the main thread
-        tui_loop(tui_state, state).await;
+        info!("Dashboard activated via systemd socket");
     } else {
-        // Just run the server on the main thread
-        axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .await
-        .unwrap();
-    }
-}
-
-async fn tui_loop(tui_state: Arc<Mutex<TuiState>>, state: Arc<AppState>) {
-    let mut dashboard = tui::TuiDashboard::new();
-    let toggle_notify = Arc::new(tui_state.lock().unwrap().toggle_notify.clone());
-
-    loop {
-        let visible = {
-            let tui_state = tui_state.lock().unwrap();
-            tui_state.visible
-        };
-
-        if visible {
-            match dashboard.run(&state) {
-                Ok(continue_loop) => {
-                    if !continue_loop {
-                        return;
-                    }
-                }
+        let socket_path_buf = PathBuf::from(&args.dashboard_socket);
+        let dashboard_state = state.clone();
+        tokio::spawn(async move {
+            let server = match DashboardServer::new(socket_path_buf) {
+                Ok(s) => s,
                 Err(e) => {
-                    eprintln!("TUI error: {}", e);
+                    eprintln!("Dashboard server error: {}", e);
                     return;
                 }
+            };
+            if let Err(e) = server.serve(dashboard_state).await {
+                eprintln!("Dashboard server error: {}", e);
             }
-        } else {
-            toggle_notify.notified().await;
-        }
+        });
+        info!("Dashboard enabled at {}", args.dashboard_socket);
     }
+
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .unwrap();
 }

@@ -3,11 +3,10 @@ Description=all-llama-proxy for load balancing requests to Ollama servers
 After=network.target
 
 [Service]
-Type=simple
+Type=notify
+ExecStart=/usr/local/bin/all-llama-proxy
 User=www-data
 Group=www-data
-ExecStart=/usr/local/bin/all-llama-proxy
-ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=10
 
