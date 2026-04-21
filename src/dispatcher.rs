@@ -234,10 +234,6 @@ struct ModelsResponse {
 }
 
 #[derive(Deserialize, Clone)]
-#[allow(dead_code)]
-struct ModelInfo {
-    name: String,
-}
 
 /// OpenAI-compatible model response structure
 #[derive(Serialize)]
@@ -256,10 +252,8 @@ pub struct OpenAIModelsList {
 
 // Full model info from backend /api/tags response
 #[derive(Deserialize, Clone)]
-#[allow(dead_code)]
 struct BackendModelInfo {
     name: String,
-    model: String,
     modified_at: String,
     size: u64,
     digest: String,
@@ -444,7 +438,6 @@ pub enum ResponsePart {
     Status(StatusCode, HeaderMap),
     Chunk(Bytes),
     Error(reqwest::Error),
-    #[allow(dead_code)]
     ModelNotFound(String),
 }
 
@@ -635,26 +628,6 @@ impl AppState {
         }
         self.save_blocked_items();
         warn!("User blocked: {}", user_id);
-    }
-
-    #[allow(dead_code)]
-    pub fn unblock_ip(&self, ip: IpAddr) {
-        {
-            let mut ips = self.blocked_ips.lock().unwrap();
-            ips.remove(&ip);
-        }
-        self.save_blocked_items();
-        info!("IP unblocked: {}", ip);
-    }
-
-    #[allow(dead_code)]
-    pub fn unblock_user(&self, user_id: &str) {
-        {
-            let mut users = self.blocked_users.lock().unwrap();
-            users.remove(user_id);
-        }
-        self.save_blocked_items();
-        info!("User unblocked: {}", user_id);
     }
 
     pub fn is_ip_blocked(&self, ip: &IpAddr) -> bool {
