@@ -1,6 +1,6 @@
 # all-llama-proxy
 
-`all-lama-proxy` is a high-performance, asynchronous message queue dispatcher and load balancer designed to sit in front of one or more [Ollama](https://ollama.ai/) API instances. It acts as a smart proxy that queues incoming requests from multiple users and dispatches them in parallel to multiple Ollama backends using a fair-share round-robin scheduler with least-connections load balancing.
+`all-lama-proxy` is a high-performance, asynchronous message queue dispatcher and load balancer designed to sit in front of one or more [Ollama](https://ollama.ai/) API instances. It acts as a smart proxy that queues incoming requests from multiple users and dispatches them in parallel to multiple Ollama backends using a fair-share round-robin scheduler with least-connections load balancing. The available models can be configured in a YAML file, which can be reloaded without a service restart and no downtime.
 
 `all-lama-proxy` is a fork of the awesome [`ollamaMQ`](https://github.com/Chleba/ollamaMQ) project. This project adds authentication and replaces Docker with a systemd service as the intended deployment method.
 
@@ -19,7 +19,7 @@
 - **Fair-Share Scheduling**: Prevents any single user from monopolizing all available backends.
 - **Transparent Header Forwarding**: Full support for all HTTP headers (including `X-User-ID`) passed to and from Ollama, ensuring compatibility with tools like **Claude Code**.
 - **VIP Mode**: High priority (VIP) for specific users.
-- **Real-Time TUI Dashboard**: Monitor backend health, active requests, queue depths, and throughput in real-time.
+- **Real-Time TUI Dashboard**: Monitor backend health, active requests, queue depths, and throughput in real-time. The TUI connects to the backend via a socket file.
 - **OpenAI Compatibility**: Supports standard OpenAI-compatible endpoints.
 - **Async Architecture**: Built on `tokio` and `axum` for high concurrency.
 - **Model Aliases**: Support model aliases to map legacy model requests & allow renaming models.
@@ -166,7 +166,7 @@ The interactive TUI dashboard provides a live view of the dispatcher's state:
 
 ### Request Flow
 
-1. Client sends request with `X-User-ID` header.
+1. Client sends request with `Authorization` header.
 2. Authentication via SHA256 token hash lookup; VIP status from config (can be toggled in TUI).
 3. Request placed in user-specific FIFO queue.
 4. Worker selects next user via fair-share scheduling (VIP first, then round-robin).
@@ -183,8 +183,6 @@ You can use the provided `test_dispatcher.sh` script to simulate multiple users 
 ```bash
 ./test_dispatcher.sh
 ```
-
-![all-llama-proxy Stress Test](demo-test.gif)
 
 ## 📝 License
 
