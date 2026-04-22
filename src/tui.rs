@@ -67,7 +67,7 @@ impl TuiDashboard {
             .constraints([
                 Constraint::Length(3),
                 Constraint::Min(4),
-                Constraint::Length(4),
+                Constraint::Length(6),
                 Constraint::Length(3),
                 if self.show_help { Constraint::Length(12) } else { Constraint::Length(0) },
             ])
@@ -281,7 +281,7 @@ impl TuiDashboard {
     }
 
     fn render_logs(&self, snapshot: &DashboardSnapshot) -> Paragraph<'static> {
-        let logs: Vec<Line> = snapshot.log_lines.iter().map(|(level, msg)| {
+        let logs: Vec<Line> = snapshot.log_lines.iter().map(|(level, ts, msg)| {
             let color = match level.as_str() {
                 "DEBUG" => Color::Blue,
                 "INFO"  => Color::White,
@@ -289,7 +289,14 @@ impl TuiDashboard {
                 "ERROR" => Color::Red,
                 _       => Color::Gray,
             };
+            let time_str = format!(
+                "{}",
+                chrono::DateTime::from_timestamp(*ts, 0)
+                    .unwrap_or(chrono::DateTime::UNIX_EPOCH)
+                    .format("%H:%M")
+            );
             Line::from(vec![
+                Span::styled(format!("{} ", time_str), Style::default().fg(Color::DarkGray)),
                 Span::styled(format!("{:<5} ", level), Style::default().fg(color).bold()),
                 Span::styled(msg.clone(), Style::default().fg(color)),
             ])

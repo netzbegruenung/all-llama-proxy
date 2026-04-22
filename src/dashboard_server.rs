@@ -156,7 +156,7 @@ impl DashboardServer {
             }).collect()
         };
 
-        let log_lines = state.log_buffer.get_last_n(4);
+        let log_lines = state.log_buffer.get_last_n(10);
 
         let mut user_ids: Vec<String> = queues_len.keys().cloned().collect();
         user_ids.sort_by(|a, b| {
