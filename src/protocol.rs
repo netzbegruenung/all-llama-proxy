@@ -21,7 +21,7 @@ pub struct DashboardSnapshot {
     pub user_ids: Vec<String>,
     pub backends: Vec<BackendSnapshot>,
     pub model_public_names: HashMap<String, String>,
-    pub log_lines: Vec<(String, String)>,
+    pub log_lines: Vec<(String, i64, String)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

@@ -4,6 +4,7 @@ use axum::{
     http::{HeaderMap, Method, StatusCode},
     response::IntoResponse,
 };
+use chrono::Utc;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -96,6 +97,7 @@ fn authenticate_request(
 pub struct LogEntry {
     pub level: String,
     pub message: String,
+    pub timestamp: i64,
 }
 
 /// Thread-safe circular buffer for log messages
@@ -118,20 +120,20 @@ impl LogBuffer {
             lines.push_back(LogEntry {
                 level: level.to_string(),
                 message,
+                timestamp: Utc::now().timestamp(),
             });
-            // Keep only the last max_lines entries
             while lines.len() > self.max_lines {
                 lines.pop_front();
             }
         }
     }
 
-    pub fn get_last_n(&self, n: usize) -> Vec<(String, String)> {
+    pub fn get_last_n(&self, n: usize) -> Vec<(String, i64, String)> {
         if let Ok(lines) = self.lines.read() {
             let total = lines.len();
             lines.iter()
                 .skip(total.saturating_sub(n))
-                .map(|entry| (entry.level.clone(), entry.message.clone()))
+                .map(|entry| (entry.level.clone(), entry.timestamp, entry.message.clone()))
                 .collect()
         } else {
             Vec::new()
