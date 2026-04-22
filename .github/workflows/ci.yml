@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ci:
+    name: CI
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      
+      - name: Build (release)
+        run: cargo build --release
+      
+      - name: Verify binaries
+        run: |
+          echo "Checking built binaries..."
+          ls -lh target/release/all-llama-proxy
+          ls -lh target/release/all-llama-tui
+      
+      - name: Run tests
+        run: cargo test --verbose
+      
+      - name: Run clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      
+      - name: Security audit
+        continue-on-error: true
+        run: |
+          echo "Running security audit..."
+          if command -v cargo-audit &> /dev/null; then
+            cargo audit || echo "Warning: Security audit found vulnerabilities but did not block CI"
+          else
+            echo "Installing cargo-audit..."
+            cargo install cargo-audit --quiet
+            cargo audit || echo "Warning: Security audit found vulnerabilities but did not block CI"
+          fi
+      
+      - name: Check outdated dependencies
+        continue-on-error: true
+        run: |
+          echo "Checking for outdated dependencies..."
+          if command -v cargo-outdated &> /dev/null; then
+            cargo outdated --exit-code 0 || echo "Warning: Some dependencies are outdated"
+          else
+            echo "Installing cargo-outdated..."
+            cargo install cargo-outdated --quiet
+            cargo outdated --exit-code 0 || echo "Warning: Some dependencies are outdated"
+          fi
+    
+    # Optional: Add timeout for long-running CI
+    timeout-minutes: 30
