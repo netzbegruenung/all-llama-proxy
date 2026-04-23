@@ -111,7 +111,7 @@ impl TuiDashboard {
             &mut self.blocked_table_state,
         );
 
-        f.render_widget(self.render_logs(snapshot), main_chunks[2]);
+        f.render_widget(self.render_logs(snapshot, main_chunks[2]), main_chunks[2]);
         f.render_widget(self.render_help(), main_chunks[3]);
         if self.show_help {
             f.render_widget(self.render_detailed_help(), main_chunks[4]);
@@ -468,7 +468,7 @@ impl TuiDashboard {
         )
     }
 
-    fn render_logs(&self, snapshot: &DashboardSnapshot) -> Paragraph<'static> {
+    fn render_logs(&self, snapshot: &DashboardSnapshot, area: Rect) -> Paragraph<'static> {
         let logs: Vec<Line> = snapshot
             .log_lines
             .iter()
@@ -496,6 +496,8 @@ impl TuiDashboard {
                 ])
             })
             .collect();
+        let available_height = area.height.saturating_sub(2);
+        let scroll = logs.len().saturating_sub(available_height as usize);
         Paragraph::new(logs)
             .block(
                 Block::default()
@@ -503,6 +505,7 @@ impl TuiDashboard {
                     .borders(Borders::ALL),
             )
             .style(Style::default().fg(Color::Gray))
+            .scroll((scroll as u16, 0))
     }
 
     fn render_help(&self) -> Paragraph<'static> {
