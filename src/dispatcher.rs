@@ -347,6 +347,54 @@ impl BackendStatus {
         }
     }
 
+    /// Send keep_alive request to ensure all configured models are loaded
+    pub async fn keep_alive_models(&self, client: &reqwest::Client, timeout_secs: u64) {
+        let models = self.configured_models.clone();
+        if models.is_empty() {
+            return;
+        }
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(timeout_secs))
+            .build()
+            .unwrap_or_else(|_| client.clone());
+
+        for model_name in &models {
+            let model_name = model_name.clone();
+            let url = format!("{}/api/generate", self.url);
+            let body = serde_json::json!({
+                "model": model_name,
+                "keep_alive": -1
+            });
+            let client = client.clone();
+
+            tokio::spawn(async move {
+                match client.post(&url).json(&body).send().await {
+                    Ok(resp) => {
+                        let status = resp.status();
+                        if status.is_success() {
+                            let body = resp.text().await.unwrap_or_default();
+                            if body.contains("\"done\":true") || body.contains("\"done_reason\"") {
+                                debug!("Model {} kept alive on backend {}", model_name, url);
+                            }
+                        } else {
+                            warn!(
+                                "Failed to keep alive model {} on backend {}: {}",
+                                model_name, url, status
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to keep alive model {} on backend {}: {}",
+                            model_name, url, e
+                        );
+                    }
+                }
+            });
+        }
+    }
+
     /// Check if this backend can serve a specific model
     pub fn can_serve_model(&self, model_name: &str) -> bool {
         // Extract base model name (without tag) for flexible matching
@@ -1161,16 +1209,32 @@ fn spawn_health_checker(state: Arc<AppState>, client: reqwest::Client) {
                             })
                             .unwrap_or_default();
 
-                        let mut backends = state.backends.lock().lock_unwrap("backends");
-                        let backend = &mut backends[idx];
+                        // Keep alive all configured models when backend comes back online
+                        let backend_clone = {
+                            let mut backends = state.backends.lock().lock_unwrap("backends");
+                            let backend = &mut backends[idx];
 
-                        // Mark as online
-                        if !backend.is_online {
-                            info!("Backend {} is back online", url);
-                            backend.is_online = true;
+                            if !backend.is_online {
+                                info!("Backend {} is back online", url);
+                                backend.is_online = true;
+                                Some(backend.clone())
+                            } else {
+                                None
+                            }
+                        };
+
+                        // Keep alive models outside the lock
+                        if let Some(backend) = backend_clone {
+                            let client_clone = client.clone();
+                            let timeout = state.timeout;
+                            tokio::spawn(async move {
+                                backend.keep_alive_models(&client_clone, timeout).await;
+                            });
                         }
 
                         // Update per-model status (use base-name matching)
+                        let mut backends = state.backends.lock().lock_unwrap("backends");
+                        let backend = &mut backends[idx];
                         let mut model_status =
                             backend.model_status.write().expect("model_status write");
                         let backend_model_names: HashSet<String> =
@@ -1229,6 +1293,31 @@ fn spawn_health_checker(state: Arc<AppState>, client: reqwest::Client) {
             let _ = build_tags_cache(&state, &client).await;
 
             tokio::time::sleep(std::time::Duration::from_secs(state.health_check_interval)).await;
+        }
+    });
+}
+
+fn spawn_model_keeper(state: Arc<AppState>, client: reqwest::Client) {
+    tokio::spawn(async move {
+        let keep_alive_interval = std::time::Duration::from_secs(15 * 60); // 15 minutes
+
+        loop {
+            tokio::time::sleep(keep_alive_interval).await;
+
+            let backends = state.backends.lock().lock_unwrap("backends");
+            for backend in backends.iter() {
+                if backend.is_online && !backend.configured_models.is_empty() {
+                    let backend_clone = backend.clone();
+                    let client_clone = client.clone();
+                    let timeout = state.timeout;
+
+                    tokio::spawn(async move {
+                        backend_clone
+                            .keep_alive_models(&client_clone, timeout)
+                            .await;
+                    });
+                }
+            }
         }
     });
 }
@@ -1496,6 +1585,7 @@ pub async fn run_worker(state: Arc<AppState>) {
     let mut current_idx = 0;
 
     spawn_health_checker(state.clone(), client.clone());
+    spawn_model_keeper(state.clone(), client.clone());
 
     loop {
         let selection = select_and_prepare_task(&state, &mut current_idx);

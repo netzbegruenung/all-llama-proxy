@@ -23,6 +23,7 @@
 - **OpenAI Compatibility**: Supports standard OpenAI-compatible endpoints.
 - **Async Architecture**: Built on `tokio` and `axum` for high concurrency.
 - **Model Aliases**: Support model aliases to map legacy model requests & allow renaming models.
+- **Model Keep Alive**: The proxy ensures that the configured models are loaded on the Ollama servers.
 
 ![Screenshot of TUI](screenshot.png)
 
