@@ -1725,6 +1725,19 @@ pub async fn health_handler(
         return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
     }
 
+    // Build a mapping from internal model name to public_name
+    let name_to_public: HashMap<String, String> = {
+        let config = state.model_config.read().expect("model_config read");
+        config
+            .models
+            .iter()
+            .map(|m| {
+                let display_name = m.public_name.clone().unwrap_or_else(|| m.name.clone());
+                (m.name.clone(), display_name)
+            })
+            .collect()
+    };
+
     let mut model_counts: HashMap<String, HashMap<String, usize>> = HashMap::new();
 
     let backends = state.backends.lock().lock_unwrap("backends");
@@ -1753,7 +1766,13 @@ pub async fn health_handler(
             "degraded"
         };
 
-        models.insert(model_name.clone(), status.to_string());
+        // Use public_name if available, otherwise fall back to internal name
+        let display_name = name_to_public
+            .get(model_name)
+            .cloned()
+            .unwrap_or_else(|| model_name.clone());
+
+        models.insert(display_name, status.to_string());
     }
 
     (StatusCode::OK, axum::Json(HealthResponse { models })).into_response()
