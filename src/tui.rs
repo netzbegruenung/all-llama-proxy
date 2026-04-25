@@ -209,6 +209,8 @@ impl TuiDashboard {
                     } else {
                         for model in &b.configured_models {
                             let available = b.model_status.get(model).copied().unwrap_or(true);
+                            let active = b.active_models.get(model).copied().unwrap_or(0);
+                            let done = b.processed_models.get(model).copied().unwrap_or(0);
                             let (sym, style) = if available {
                                 ("✓", Style::default().fg(Color::Green))
                             } else {
@@ -221,8 +223,8 @@ impl TuiDashboard {
                                 .unwrap_or_else(|| model.clone());
                             rows.push(Row::new(vec![
                                 Cell::from(format!("  {} {}", sym, display_name)).style(style),
-                                Cell::from(""),
-                                Cell::from(""),
+                                Cell::from(active.to_string()),
+                                Cell::from(done.to_string()),
                             ]));
                         }
                     }

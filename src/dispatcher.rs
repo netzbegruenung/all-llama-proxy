@@ -335,6 +335,8 @@ pub struct BackendStatus {
     pub active_requests: usize,
     pub processed_count: usize,
     pub is_online: bool,
+    pub active_models: HashMap<String, usize>,
+    pub processed_models: HashMap<String, usize>,
     /// Models this backend is configured to serve (from config)
     pub configured_models: Vec<String>,
     /// Per-model verification status (true = available, false = not available)
@@ -348,6 +350,8 @@ impl BackendStatus {
             active_requests: 0,
             processed_count: 0,
             is_online: true,
+            active_models: HashMap::new(),
+            processed_models: HashMap::new(),
             configured_models: Vec::new(),
             model_status: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -1168,13 +1172,20 @@ fn dispatch_task(args: DispatchTaskArgs) {
             }
         }
 
-        {
-            let mut backends = state.backends.lock().lock_unwrap("backends");
-            backends[backend_idx].active_requests =
-                backends[backend_idx].active_requests.saturating_sub(1);
-            backends[backend_idx].processed_count += 1;
-        }
-        state.backend_freed.notify_one();
+            {
+                let mut backends = state.backends.lock().lock_unwrap("backends");
+                let backend = &mut backends[backend_idx];
+                backend.active_requests = backend.active_requests.saturating_sub(1);
+                if let Some(model) = task.resolved_model.as_ref() {
+                    let count = backend.active_models.entry(model.clone()).or_insert(0);
+                    *count = count.saturating_sub(1);
+                }
+                backend.processed_count += 1;
+                if let Some(model) = task.resolved_model.as_ref() {
+                    *backend.processed_models.entry(model.clone()).or_insert(0) += 1;
+                }
+            }
+            state.backend_freed.notify_one();
     });
 }
 
@@ -1533,6 +1544,7 @@ fn select_and_prepare_task(state: &Arc<AppState>, current_idx: &mut usize) -> Se
                 }
 
                 backends[selected_backend_idx].active_requests += 1;
+                *backends[selected_backend_idx].active_models.entry(model.clone()).or_insert(0) += 1;
                 SelectionResult::Dispatch(
                     user_id,
                     task,
