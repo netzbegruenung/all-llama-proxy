@@ -14,6 +14,7 @@
 ```bash
 cargo build
 cargo build --release
+cargo fmt --all -- --check                                                              # check formatting (CI requirement)
 cargo run -- --bind 0.0.0.0:8080 --models-config-path ./examples/models.yaml --users-path ./examples/users.yaml     # dev run
 cargo run --bin all-llama-tui                                                         # launch TUI dashboard
 cargo test                                                                            # auth.rs unit tests (line 101-189)

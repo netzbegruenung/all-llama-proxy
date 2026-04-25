@@ -1914,6 +1914,8 @@ mod tests {
                 active_requests: 0,
                 processed_count: 0,
                 is_online: true,
+                active_models: HashMap::new(),
+                processed_models: HashMap::new(),
                 model_status: Arc::new(RwLock::new(HashMap::new())),
             });
         }
