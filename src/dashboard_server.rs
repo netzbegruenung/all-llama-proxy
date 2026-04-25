@@ -199,16 +199,16 @@ impl DashboardServer {
             .map(|b| {
                 let model_status = b.model_status.read().expect("model_status read");
                 let ms = model_status.clone();
-                    BackendSnapshot {
-                        url: b.url.clone(),
-                        active_requests: b.active_requests,
-                        processed_count: b.processed_count,
-                        is_online: b.is_online,
-                        active_models: b.active_models.clone(),
-                        processed_models: b.processed_models.clone(),
-                        configured_models: b.configured_models.clone(),
-                        model_status: ms,
-                    }
+                BackendSnapshot {
+                    url: b.url.clone(),
+                    active_requests: b.active_requests,
+                    processed_count: b.processed_count,
+                    is_online: b.is_online,
+                    active_models: b.active_models.clone(),
+                    processed_models: b.processed_models.clone(),
+                    configured_models: b.configured_models.clone(),
+                    model_status: ms,
+                }
             })
             .collect();
 

@@ -1172,20 +1172,20 @@ fn dispatch_task(args: DispatchTaskArgs) {
             }
         }
 
-            {
-                let mut backends = state.backends.lock().lock_unwrap("backends");
-                let backend = &mut backends[backend_idx];
-                backend.active_requests = backend.active_requests.saturating_sub(1);
-                if let Some(model) = task.resolved_model.as_ref() {
-                    let count = backend.active_models.entry(model.clone()).or_insert(0);
-                    *count = count.saturating_sub(1);
-                }
-                backend.processed_count += 1;
-                if let Some(model) = task.resolved_model.as_ref() {
-                    *backend.processed_models.entry(model.clone()).or_insert(0) += 1;
-                }
+        {
+            let mut backends = state.backends.lock().lock_unwrap("backends");
+            let backend = &mut backends[backend_idx];
+            backend.active_requests = backend.active_requests.saturating_sub(1);
+            if let Some(model) = task.resolved_model.as_ref() {
+                let count = backend.active_models.entry(model.clone()).or_insert(0);
+                *count = count.saturating_sub(1);
             }
-            state.backend_freed.notify_one();
+            backend.processed_count += 1;
+            if let Some(model) = task.resolved_model.as_ref() {
+                *backend.processed_models.entry(model.clone()).or_insert(0) += 1;
+            }
+        }
+        state.backend_freed.notify_one();
     });
 }
 
@@ -1544,7 +1544,10 @@ fn select_and_prepare_task(state: &Arc<AppState>, current_idx: &mut usize) -> Se
                 }
 
                 backends[selected_backend_idx].active_requests += 1;
-                *backends[selected_backend_idx].active_models.entry(model.clone()).or_insert(0) += 1;
+                *backends[selected_backend_idx]
+                    .active_models
+                    .entry(model.clone())
+                    .or_insert(0) += 1;
                 SelectionResult::Dispatch(
                     user_id,
                     task,
