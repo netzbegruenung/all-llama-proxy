@@ -633,35 +633,51 @@ impl AppState {
             *write_guard = new_config.clone();
         }
 
-        // Update backend configurations
+        let all_new_backends = new_config.get_all_backends();
+
         {
             let mut backends = self.backends.lock().lock_unwrap("backends");
+
+            // Remove backends that are no longer in the config
+            backends.retain(|b| all_new_backends.contains(&b.url));
+
+            // Update existing backends and identify which ones are already present
+            let mut current_urls = HashSet::new();
             for backend in backends.iter_mut() {
+                current_urls.insert(backend.url.clone());
                 backend.configured_models = new_config.get_models_for_backend(&backend.url);
 
-                // Preserve existing per-model status for models that remain configured
                 let mut new_status = HashMap::new();
                 for model_name in &backend.configured_models {
-                    // Check old status, default to true if not known
-                    let old_status = self
-                        .model_config
+                    let old_status = backend
+                        .model_status
                         .read()
-                        .expect("model_config read")
-                        .get_model(model_name)
-                        .map(|_| {
-                            // Try to get old status
-                            backend
-                                .model_status
-                                .read()
-                                .expect("model_status read")
-                                .get(model_name)
-                                .copied()
-                        });
+                        .expect("model_status read")
+                        .get(model_name)
+                        .copied();
 
-                    new_status.insert(model_name.clone(), old_status.flatten().unwrap_or(true));
+                    new_status.insert(model_name.clone(), old_status.unwrap_or(true));
                 }
                 *backend.model_status.write().expect("model_status write") = new_status;
             }
+
+            // Add new backends
+            for url in all_new_backends {
+                if !current_urls.contains(&url) {
+                    let mut backend = BackendStatus::new(url.clone());
+                    backend.configured_models = new_config.get_models_for_backend(&url);
+
+                    let mut initial_status = HashMap::new();
+                    for model_name in &backend.configured_models {
+                        initial_status.insert(model_name.clone(), true);
+                    }
+                    *backend.model_status.write().expect("model_status write") = initial_status;
+
+                    backends.push(backend);
+                }
+            }
+
+            backends.sort_by(|a, b| a.url.cmp(&b.url));
         }
 
         Ok(())
