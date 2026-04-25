@@ -30,6 +30,8 @@ pub struct BackendSnapshot {
     pub active_requests: usize,
     pub processed_count: usize,
     pub is_online: bool,
+    pub active_models: HashMap<String, usize>,
+    pub processed_models: HashMap<String, usize>,
     pub configured_models: Vec<String>,
     pub model_status: HashMap<String, bool>,
 }
