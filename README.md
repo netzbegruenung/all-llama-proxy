@@ -60,7 +60,7 @@ Go to the [releases section](https://github.com/netzbegruenung/all-llama-proxy/r
 - `--bind <INTERFACE:PORT>`: Interface and port to listen on (default: `127.0.0.1:11435`)
 - `-t, --timeout <SECONDS>`: Request timeout in seconds (default: `300`)
 - `--allow-all-routes`: Enable fallback proxy for non-standard endpoints
-- `-i, --ip-header`: trusted source IP header, useful behind proxy for TLS offloading
+- `-i, --ip-header`: trusted source IP header, useful behind proxy for TLS offloading. Make sure that you do not trust headers that you do not control.
 - `-h, --help`: Print help message
 - `-V, --version`: Print version information
 - `--debug`: print debug messages to log file
