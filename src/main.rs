@@ -1,7 +1,7 @@
 use all_llama_proxy::utils::LockExt;
 use all_llama_proxy::{
-    AppState, DashboardServer, LogBuffer, LogBufferWriter, UserRegistry, health_handler,
-    model_handler, models_handler, proxy_handler, run_worker, tags_handler,
+    AppState, DashboardServer, LogBuffer, LogBufferWriter, UserRegistry, model_handler,
+    models_handler, proxy_handler, run_worker, tags_handler,
 };
 use axum::{
     Router,
@@ -179,7 +179,7 @@ async fn main() {
     });
 
     let app = Router::new()
-        .route("/health", get(health_handler))
+        .route("/health", get(all_llama_proxy::health::health_handler))
         .route("/", any(proxy_handler))
         .route("/api/generate", any(proxy_handler))
         .route("/api/chat", any(proxy_handler))
