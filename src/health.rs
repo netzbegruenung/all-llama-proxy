@@ -1,4 +1,4 @@
-use crate::dispatcher::{AppState, BackendStatus};
+use crate::appstate::{AppState, BackendStatus};
 use crate::utils::LockExt;
 use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
 use serde::{Deserialize, Serialize};
@@ -19,7 +19,7 @@ pub struct BackendModelInfo {
     pub modified_at: String,
     pub size: u64,
     pub digest: String,
-    pub details: crate::dispatcher::ModelDetails,
+    pub details: crate::appstate::ModelDetails,
 }
 
 /// Build merged /api/tags cache from all configured models using their first backends
@@ -38,7 +38,7 @@ pub async fn build_tags_cache(
             .collect()
     };
 
-    let mut merged_models: Vec<crate::dispatcher::PublicModelInfo> = Vec::new();
+    let mut merged_models: Vec<crate::appstate::PublicModelInfo> = Vec::new();
 
     for (model_name, public_name_opt, backend_url) in models_to_fetch {
         let url = format!("{}/api/tags", backend_url);
@@ -62,7 +62,7 @@ pub async fn build_tags_cache(
                             let public_name = public_name_opt.as_ref().unwrap_or(&model_name);
 
                             // Create PublicModelInfo with public_name overriding name/model
-                            merged_models.push(crate::dispatcher::PublicModelInfo {
+                            merged_models.push(crate::appstate::PublicModelInfo {
                                 name: public_name.clone(),
                                 model: public_name.clone(),
                                 modified_at: backend_info.modified_at,
@@ -86,7 +86,7 @@ pub async fn build_tags_cache(
     // Update cache
     {
         let mut cache = state.cached_tags.write().expect("cached_tags write");
-        *cache = Some(crate::dispatcher::CachedTags {
+        *cache = Some(crate::appstate::CachedTags {
             models: merged_models,
         });
         let model_count = cache.as_ref().map(|c| c.models.len()).unwrap_or(0);

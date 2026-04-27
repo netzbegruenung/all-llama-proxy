@@ -1,4 +1,4 @@
-use crate::dispatcher::AppState;
+use crate::appstate::AppState;
 use crate::protocol::{BackendSnapshot, DashboardCmd, DashboardSnapshot, consumed_len, decode};
 use crate::utils::LockExt;
 use std::collections::HashMap;
