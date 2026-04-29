@@ -329,10 +329,19 @@ impl ModelConfig {
 
     /// Resolve alias to real model name, returns None if not found
     pub fn resolve_alias(&self, model_name: &str) -> Option<String> {
-        // Check aliases first
+        // Check explicit aliases first
         for model in &self.models {
             if model.aliases.contains(&model_name.to_string()) {
                 return Some(model.name.clone());
+            }
+        }
+
+        // Check public_name as implicit alias
+        for model in &self.models {
+            if let Some(ref public_name) = model.public_name {
+                if public_name == model_name {
+                    return Some(model.name.clone());
+                }
             }
         }
 
@@ -346,11 +355,13 @@ impl ModelConfig {
         None
     }
 
-    /// Get ParsedModel by name or alias
+    /// Get ParsedModel by name or alias (including public_name)
     pub fn get_model(&self, model_name: &str) -> Option<&ParsedModel> {
-        self.models
-            .iter()
-            .find(|m| m.name == model_name || m.aliases.contains(&model_name.to_string()))
+        self.models.iter().find(|m| {
+            m.name == model_name
+                || m.aliases.contains(&model_name.to_string())
+                || m.public_name.as_ref().map_or(false, |pn| pn == model_name)
+        })
     }
 
     /// Get all unique backend URLs from all models
