@@ -12,7 +12,7 @@
 
 - **Multi-Backend Load Balancing**: Distribute requests across multiple Ollama instances using a **Least Connections + Round Robin** strategy.
 - **Parallel Processing**: Unlike basic proxies, `all-llama-proxy` can process multiple requests simultaneously (configurable limit per backend), significantly increasing throughput for multiple users.
-- **Backend Health Checks**: Automatically monitors backend status every 10 seconds; offline instances are temporarily skipped and marked in the TUI.
+- **Backend Health Checks**: Automatically monitors backend status every 10 seconds; offline instances are temporarily skipped and marked in the TUI. Model discovery works with both Ollama (`/api/tags`) and llama.cpp (`/v1/models`), whichever the backend serves.
 - **Config Reload**: reload the config with a SIGHUP signal without restarting the service.
 - **Authentication**: A simple user database that allows adding SHA256 sums of access tokens.
 - **Per-User Queuing**: Each user (identified by the `X-User-ID` header) has their own FIFO queue.
@@ -23,7 +23,7 @@
 - **OpenAI Compatibility**: Supports standard OpenAI-compatible endpoints.
 - **Async Architecture**: Built on `tokio` and `axum` for high concurrency.
 - **Model Aliases**: Support model aliases to map legacy model requests & allow renaming models.
-- **Model Keep Alive**: The proxy ensures that the configured models are loaded on the Ollama servers.
+- **Model Keep Alive**: The proxy ensures that the configured models are loaded on the backends. It periodically sends a 1-token chat completion to `/v1/chat/completions`, which works with both Ollama and llama.cpp. Keeping a model resident afterwards is up to the backend — set `OLLAMA_KEEP_ALIVE=-1` on Ollama hosts to prevent the default 5-minute unload.
 
 ![Screenshot of TUI](screenshot.png)
 
