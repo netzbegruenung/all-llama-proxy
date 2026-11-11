@@ -129,6 +129,7 @@ fn normalize_path(path: &str) -> &str {
 const MODEL_PATHS: &[&str] = &[
     "/api/generate",
     "/api/chat",
+    "/api/show",
     "/api/embed",
     "/api/embeddings",
     "/chat/completions",
@@ -971,29 +972,72 @@ pub async fn proxy_handler(
     }
 }
 
+/// OpenAI-style error body, so clients of the `/v1/*` routes can parse failures.
+fn openai_error(status: StatusCode, code: &str, message: &str) -> axum::response::Response {
+    (
+        status,
+        axum::Json(serde_json::json!({
+            "error": { "code": code, "message": message }
+        })),
+    )
+        .into_response()
+}
+
+/// Authenticate a read-only metadata request and apply IP/user blocks.
+fn authorize_metadata_request(
+    state: &AppState,
+    headers: &HeaderMap,
+    addr: SocketAddr,
+    kind: &str,
+    openai_style: bool,
+) -> Result<String, axum::response::Response> {
+    let ip = extract_client_ip(headers, addr, &state.ip_header);
+
+    let deny = |status: StatusCode, code: &str, message: &str| {
+        if openai_style {
+            openai_error(status, code, message)
+        } else {
+            (status, message.to_string()).into_response()
+        }
+    };
+
+    let user_id = match authenticate_request(headers, &state.user_registry, ip, true) {
+        Some(uid) => uid,
+        None => {
+            return Err(deny(
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+                "Unauthorized",
+            ));
+        }
+    };
+
+    if state.is_ip_blocked(&ip) {
+        warn!(
+            "Blocked {} request from IP: {} for user: {}",
+            kind, ip, user_id
+        );
+        return Err(deny(StatusCode::FORBIDDEN, "ip_blocked", "IP blocked"));
+    }
+    if state.is_user_blocked(&user_id) {
+        warn!(
+            "Blocked {} request from user: {} (IP: {})",
+            kind, user_id, ip
+        );
+        return Err(deny(StatusCode::FORBIDDEN, "user_blocked", "User blocked"));
+    }
+
+    Ok(user_id)
+}
+
 pub async fn tags_handler(
     State(state): State<Arc<AppState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     _method: Method,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    // Extract IP
-    let ip = extract_client_ip(&headers, addr, &state.ip_header);
-
-    // Authentication
-    let user_id = match authenticate_request(&headers, &state.user_registry, ip, true) {
-        Some(uid) => uid,
-        None => return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response(),
-    };
-
-    // Check blocking
-    if state.is_ip_blocked(&ip) {
-        warn!("Blocked tags request from IP: {} for user: {}", ip, user_id);
-        return (StatusCode::FORBIDDEN, "IP blocked").into_response();
-    }
-    if state.is_user_blocked(&user_id) {
-        warn!("Blocked tags request from user: {} (IP: {})", user_id, ip);
-        return (StatusCode::FORBIDDEN, "User blocked").into_response();
+    if let Err(response) = authorize_metadata_request(&state, &headers, addr, "tags", false) {
+        return response;
     }
 
     // Return cached response (or empty list if not populated)
@@ -1009,7 +1053,15 @@ pub async fn tags_handler(
 }
 
 /// OpenAI-compatible models list handler
-pub async fn models_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+pub async fn models_handler(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(response) = authorize_metadata_request(&state, &headers, addr, "models", true) {
+        return response;
+    }
+
     let models_list = build_models_list(&state.cached_tags.read().expect("cached_tags read"));
     (StatusCode::OK, axum::Json(models_list)).into_response()
 }
@@ -1017,20 +1069,21 @@ pub async fn models_handler(State(state): State<Arc<AppState>>) -> impl IntoResp
 /// OpenAI-compatible single model handler
 pub async fn model_handler(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Path(model_name): Path<String>,
 ) -> impl IntoResponse {
+    if let Err(response) = authorize_metadata_request(&state, &headers, addr, "model", true) {
+        return response;
+    }
+
     match find_model_by_name(&state, &model_name) {
         Some(model) => (StatusCode::OK, axum::Json(model)).into_response(),
-        None => (
+        None => openai_error(
             StatusCode::NOT_FOUND,
-            axum::Json(serde_json::json!({
-                "error": {
-                    "code": "model_not_found",
-                    "message": format!("Model '{}' not found", model_name)
-                }
-            })),
-        )
-            .into_response(),
+            "model_not_found",
+            &format!("Model '{}' not found", model_name),
+        ),
     }
 }
 
