@@ -58,7 +58,7 @@ Go to the [releases section](https://github.com/netzbegruenung/all-llama-proxy/r
 - `--models-config-path`: path to the model configuration file (default: `/etc/all-llama-proxy/models.yaml`)
 - `--users-path`: path to the users config file (default: `/etc/all-llama-proxy/users.yaml`)
 - `--bind <INTERFACE:PORT>`: Interface and port to listen on (default: `127.0.0.1:11435`)
-- `-t, --timeout <SECONDS>`: Request timeout in seconds (default: `300`)
+- `-t, --timeout <SECONDS>`: Backend idle timeout in seconds (default: `300`). A request fails when the backend sends nothing for this long, including while waiting for the first byte; a response that keeps streaming is not cut off.
 - `--allow-all-routes`: Enable fallback proxy for non-standard endpoints
 - `-i, --ip-header`: trusted source IP header, useful behind proxy for TLS offloading. Make sure that you do not trust headers that you do not control.
 - `-h, --help`: Print help message

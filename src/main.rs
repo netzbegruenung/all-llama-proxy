@@ -205,7 +205,6 @@ async fn main() {
         .route("/v1/models", get(models_handler))
         .route("/models/{model_name}", get(model_handler))
         .route("/v1/models/{model_name}", get(model_handler))
-        .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024 * 1024))
         .with_state(state.clone());
 
     let listener = tokio::net::TcpListener::bind(&addr)

@@ -91,6 +91,8 @@ Example systemd files in `examples/all-llama-proxy.service` and `examples/all-ll
 - Health checker queries `/api/tags` every 10s per backend (dispatcher.rs:1054)
 - Model aliases are resolved in-body before dispatch (dispatcher.rs:696) — the `model` JSON field is rewritten to the real name
 - `normalize_model_tag` (dispatcher.rs:751) appends `:latest` if no tag present
-- Max body limit: 1 GB (main.rs:180)
+- Max body limit: 1 GB (`MAX_BODY_BYTES`, dispatcher.rs), enforced inside `proxy_handler` **after** authentication — the handler takes the raw `Body` on purpose; do not switch it back to a `Bytes` extractor or add a body-buffering layer, or unauthenticated clients can make the proxy buffer 1 GB each
+- `--timeout` is a backend **idle** timeout (`read_timeout`), not a total deadline, so long streams survive; mid-stream backend errors are forwarded as `ResponsePart::Error` so the client connection aborts instead of ending cleanly
+- Backends are looked up by URL after any `.await` (dispatcher.rs `dispatch_task`, health.rs health checker), never by index into `state.backends` — SIGHUP reload removes and re-sorts that list
 - Auth uses `subtle::ConstantTimeEq` — never break the scanning loop (auth.rs:72)
 - Dashboard supports both standalone Unix socket and systemd socket activation (dashboard_server.rs:28)

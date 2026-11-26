@@ -19,6 +19,9 @@ use crate::utils::LockExt;
 
 const BLOCKED_FILE: &str = "blocked_items.json";
 
+/// How long to wait for a TCP/TLS connection to a backend.
+const BACKEND_CONNECT_TIMEOUT_SECS: u64 = 10;
+
 /// Log entry for the in-TUI log buffer
 pub struct LogEntry {
     pub level: String,
@@ -537,8 +540,14 @@ impl AppState {
             );
         }
 
+        // `timeout` is an idle timeout, not a deadline for the whole request:
+        // a total `.timeout()` would cut off every streamed generation that
+        // runs longer than it, however healthy the backend is. `read_timeout`
+        // restarts after each successful read, so it only fires when the
+        // backend stops sending (including while waiting for the headers).
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(timeout))
+            .connect_timeout(std::time::Duration::from_secs(BACKEND_CONNECT_TIMEOUT_SECS))
+            .read_timeout(std::time::Duration::from_secs(timeout))
             .build()
             .expect("Failed to create reqwest client");
 

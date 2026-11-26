@@ -304,16 +304,15 @@ pub fn spawn_health_checker(state: Arc<AppState>) {
         let _ = build_tags_cache(&state, &state.client, &mut endpoints).await;
 
         loop {
-            let backends_to_check: Vec<(usize, String)> = {
+            // Backends are tracked by URL, never by position: a SIGHUP reload
+            // can remove or re-sort them while a probe is awaiting.
+            let backends_to_check: Vec<String> = {
                 let backends = state.backends.lock().lock_unwrap("backends");
-                backends
-                    .iter()
-                    .enumerate()
-                    .map(|(i, b)| (i, b.url.clone()))
-                    .collect()
+                backends.iter().map(|b| b.url.clone()).collect()
             };
+            endpoints.retain(|known, _| backends_to_check.contains(known));
 
-            for (idx, url) in backends_to_check {
+            for url in backends_to_check {
                 let preferred = endpoints.entry(url.clone()).or_default();
 
                 match fetch_backend_models(&state.client, &url, preferred).await {
@@ -321,14 +320,14 @@ pub fn spawn_health_checker(state: Arc<AppState>) {
                         // Keep alive all configured models when backend comes back online
                         let backend = {
                             let mut backends = state.backends.lock().lock_unwrap("backends");
-                            let backend = &mut backends[idx];
 
-                            if !backend.is_online {
-                                info!("Backend {} is back online", url);
-                                backend.is_online = true;
-                                Some(backend.clone())
-                            } else {
-                                None
+                            match backends.iter_mut().find(|b| b.url == url) {
+                                Some(backend) if !backend.is_online => {
+                                    info!("Backend {} is back online", url);
+                                    backend.is_online = true;
+                                    Some(backend.clone())
+                                }
+                                _ => None,
                             }
                         };
 
@@ -338,7 +337,10 @@ pub fn spawn_health_checker(state: Arc<AppState>) {
 
                         // Update per-model status (use base-name matching)
                         let mut backends = state.backends.lock().lock_unwrap("backends");
-                        let backend = &mut backends[idx];
+                        let Some(backend) = backends.iter_mut().find(|b| b.url == url) else {
+                            // Removed from the config while we were probing.
+                            continue;
+                        };
                         let mut model_status =
                             backend.model_status.write().expect("model_status write");
                         let backend_model_names: HashSet<String> =
@@ -376,7 +378,10 @@ pub fn spawn_health_checker(state: Arc<AppState>) {
                     }
                     Err(reason) => {
                         let mut backends = state.backends.lock().lock_unwrap("backends");
-                        let backend = &mut backends[idx];
+                        let Some(backend) = backends.iter_mut().find(|b| b.url == url) else {
+                            // Removed from the config while we were probing.
+                            continue;
+                        };
 
                         if backend.is_online {
                             match reason {
