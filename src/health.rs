@@ -1,8 +1,8 @@
-use crate::appstate::{AppState, BackendStatus};
+use crate::appstate::{AppState, BackendStatus, model_names_match};
 use crate::utils::LockExt;
 use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
@@ -11,6 +11,11 @@ use tracing::{debug, info, warn};
 /// Ollama serves `/api/tags`; llama.cpp answers that with a 404 and only
 /// serves `/v1/models`.
 const MODEL_LIST_ENDPOINTS: [&str; 2] = ["/api/tags", "/v1/models"];
+
+/// Deadlines for health probes (model list requests), deliberately far below
+/// the proxy's generation timeout.
+const HEALTH_CONNECT_TIMEOUT_SECS: u64 = 5;
+const HEALTH_REQUEST_TIMEOUT_SECS: u64 = 10;
 
 /// Parsed model list from `/api/tags` or `/v1/models`.
 ///
@@ -227,189 +232,216 @@ where
     }
 }
 
-/// Build merged /api/tags cache from all configured models using their first backends
-pub async fn build_tags_cache(
-    state: &AppState,
-    client: &reqwest::Client,
-    endpoints: &mut HashMap<String, Option<&'static str>>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    // Clone model list to release the lock before awaiting
-    let models_to_fetch: Vec<(String, Option<String>, String)> = {
+/// Whether a backend's model list contains `configured_model`.
+///
+/// Names are compared in full; only a missing tag is treated as `:latest`.
+/// Comparing just the part before the colon would count a backend holding
+/// `qwen3:4b` as serving `qwen3:35b` and route requests to it that it can only
+/// answer with "model not found".
+pub fn backend_has_model(backend_models: &[BackendModelInfo], configured_model: &str) -> bool {
+    backend_models
+        .iter()
+        .any(|m| model_names_match(&m.name, configured_model))
+}
+
+/// Build the merged /api/tags cache from the model lists most recently fetched
+/// by the health checker (`lists`: backend URL -> its models; backends that
+/// failed their last probe are absent).
+///
+/// Each configured model is described by the first of its backends, in config
+/// order, that currently reports it - so the model stays listed while any
+/// backend serves it, and no extra requests are needed.
+pub fn build_tags_cache(state: &AppState, lists: &HashMap<String, Vec<BackendModelInfo>>) {
+    let merged_models: Vec<crate::appstate::PublicModelInfo> = {
         let config = state.model_config.read().expect("model_config read");
         config
             .models
             .iter()
-            .filter(|m| !m.backends.is_empty())
-            .map(|m| (m.name.clone(), m.public_name.clone(), m.backends[0].clone()))
+            .filter_map(|m| {
+                let info = m.backends.iter().find_map(|backend_url| {
+                    lists
+                        .get(backend_url)?
+                        .iter()
+                        .find(|info| model_names_match(&info.name, &m.name))
+                })?;
+                let public_name = m.public_name.as_ref().unwrap_or(&m.name);
+
+                Some(crate::appstate::PublicModelInfo {
+                    name: public_name.clone(),
+                    model: public_name.clone(),
+                    modified_at: info.modified_at.clone(),
+                    size: info.size,
+                    digest: info.digest.clone(),
+                    details: info.details.clone(),
+                })
+            })
             .collect()
     };
 
-    let mut merged_models: Vec<crate::appstate::PublicModelInfo> = Vec::new();
+    debug!("Built cache with {} models", merged_models.len());
+    *state.cached_tags.write().expect("cached_tags write") = Some(crate::appstate::CachedTags {
+        models: merged_models,
+    });
+}
 
-    for (model_name, public_name_opt, backend_url) in models_to_fetch {
-        let preferred = endpoints.entry(backend_url.clone()).or_default();
+/// Apply one backend's probe result to the shared state.
+///
+/// Returns `true` when something became routable (backend back online or a
+/// model newly available), in which case the scheduler must be woken.
+fn apply_probe_result(
+    state: &AppState,
+    url: &str,
+    result: &Result<Vec<BackendModelInfo>, FetchError>,
+) -> bool {
+    let mut became_available = false;
+    let mut back_online: Option<BackendStatus> = None;
 
-        let backend_models = match fetch_backend_models(client, &backend_url, preferred).await {
-            Ok(models) => models,
-            Err(_) => {
-                debug!(
-                    "No model list from {} while caching model {}",
-                    backend_url, model_name
-                );
-                continue;
-            }
+    {
+        // Backends are looked up by URL, never by position: a SIGHUP reload
+        // can remove or re-sort them while a probe is awaiting.
+        let mut backends = state.backends.lock().lock_unwrap("backends");
+        let Some(backend) = backends.iter_mut().find(|b| b.url == url) else {
+            // Removed from the config while we were probing.
+            return false;
         };
 
-        // Find matching model in backend response
-        if let Some(backend_info) = backend_models
-            .into_iter()
-            .find(|info| info.name == model_name || info.name.starts_with(model_name.as_str()))
-        {
-            // Get public_name (or fallback to name)
-            let public_name = public_name_opt.as_ref().unwrap_or(&model_name);
+        match result {
+            Ok(backend_models) => {
+                if !backend.is_online {
+                    info!("Backend {} is back online", url);
+                    backend.is_online = true;
+                    became_available = true;
+                    back_online = Some(backend.clone());
+                }
 
-            // Create PublicModelInfo with public_name overriding name/model
-            merged_models.push(crate::appstate::PublicModelInfo {
-                name: public_name.clone(),
-                model: public_name.clone(),
-                modified_at: backend_info.modified_at,
-                size: backend_info.size,
-                digest: backend_info.digest,
-                details: backend_info.details,
-            });
+                let mut model_status = backend.model_status.write().expect("model_status write");
+
+                for configured_model in &backend.configured_models {
+                    let was_available = model_status.get(configured_model).copied().unwrap_or(true);
+                    let is_available = backend_has_model(backend_models, configured_model);
+
+                    if was_available && !is_available {
+                        warn!(
+                            "Backend {} no longer has model {} available (but is configured)",
+                            url, configured_model
+                        );
+                    } else if !was_available && is_available {
+                        info!(
+                            "Backend {} now has model {} available",
+                            url, configured_model
+                        );
+                        became_available = true;
+                    }
+
+                    model_status.insert(configured_model.clone(), is_available);
+                }
+            }
+            Err(reason) => {
+                if backend.is_online {
+                    match reason {
+                        FetchError::Unreachable => {
+                            info!("Backend {} went offline", url)
+                        }
+                        FetchError::NoUsableList(failures) => warn!(
+                            "Backend {} responded but served no model list on {} — marking offline ({})",
+                            url,
+                            MODEL_LIST_ENDPOINTS.join(" or "),
+                            failures.join("; ")
+                        ),
+                    }
+                    backend.is_online = false;
+                }
+
+                // Mark all configured models as unavailable
+                let mut model_status = backend.model_status.write().expect("model_status write");
+                for model_name in &backend.configured_models {
+                    model_status.insert(model_name.clone(), false);
+                }
+            }
         }
     }
 
-    // Update cache
-    {
-        let mut cache = state.cached_tags.write().expect("cached_tags write");
-        *cache = Some(crate::appstate::CachedTags {
-            models: merged_models,
-        });
-        let model_count = cache.as_ref().map(|c| c.models.len()).unwrap_or(0);
-        debug!("Built cache with {} models", model_count);
+    // Keep alive all configured models when the backend comes back online
+    if let Some(backend) = back_online {
+        state.spawn_keep_alive_for_backend(&backend);
     }
 
-    Ok(())
+    became_available
 }
 
 /// Spawn health checker that monitors backend status every N seconds
 pub fn spawn_health_checker(state: Arc<AppState>) {
     tokio::spawn(async move {
+        // Probes get their own client with a short deadline. The proxy client's
+        // timeout is sized for generations (minutes); with it, one backend that
+        // accepts connections but never answers would stall status updates.
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(HEALTH_CONNECT_TIMEOUT_SECS))
+            .timeout(std::time::Duration::from_secs(HEALTH_REQUEST_TIMEOUT_SECS))
+            .build()
+            .unwrap_or_else(|_| state.client.clone());
+
         // Remembers which endpoint last served each backend's model list, so
         // the steady state costs one request instead of probing both.
         let mut endpoints: HashMap<String, Option<&'static str>> = HashMap::new();
 
-        // Build initial cache
-        let _ = build_tags_cache(&state, &state.client, &mut endpoints).await;
+        // Latest model list per backend that answered, feeding the tags cache.
+        // Kept across cycles so the cache can be refreshed the moment a single
+        // probe completes, without waiting for the rest of the cycle.
+        let lists: std::sync::Mutex<HashMap<String, Vec<BackendModelInfo>>> =
+            std::sync::Mutex::new(HashMap::new());
 
         loop {
-            // Backends are tracked by URL, never by position: a SIGHUP reload
-            // can remove or re-sort them while a probe is awaiting.
             let backends_to_check: Vec<String> = {
                 let backends = state.backends.lock().lock_unwrap("backends");
                 backends.iter().map(|b| b.url.clone()).collect()
             };
             endpoints.retain(|known, _| backends_to_check.contains(known));
+            lists
+                .lock()
+                .lock_unwrap("health lists")
+                .retain(|known, _| backends_to_check.contains(known));
 
-            for url in backends_to_check {
-                let preferred = endpoints.entry(url.clone()).or_default();
+            // Probe all backends concurrently so a slow one cannot delay the
+            // others; each list is fetched once and reused for the tags cache.
+            //
+            // Each result is applied as soon as its own probe finishes, not
+            // after the slowest one: otherwise a hung backend would hold back
+            // the status of every healthy backend until its probe times out.
+            let probes = backends_to_check.into_iter().map(|url| {
+                let client = &client;
+                let state = &state;
+                let lists = &lists;
+                let mut preferred = endpoints.get(&url).copied().flatten();
+                async move {
+                    let result = fetch_backend_models(client, &url, &mut preferred).await;
 
-                match fetch_backend_models(&state.client, &url, preferred).await {
-                    Ok(backend_models) => {
-                        // Keep alive all configured models when backend comes back online
-                        let backend = {
-                            let mut backends = state.backends.lock().lock_unwrap("backends");
-
-                            match backends.iter_mut().find(|b| b.url == url) {
-                                Some(backend) if !backend.is_online => {
-                                    info!("Backend {} is back online", url);
-                                    backend.is_online = true;
-                                    Some(backend.clone())
-                                }
-                                _ => None,
-                            }
-                        };
-
-                        if let Some(backend) = backend {
-                            state.spawn_keep_alive_for_backend(&backend);
-                        }
-
-                        // Update per-model status (use base-name matching)
-                        let mut backends = state.backends.lock().lock_unwrap("backends");
-                        let Some(backend) = backends.iter_mut().find(|b| b.url == url) else {
-                            // Removed from the config while we were probing.
-                            continue;
-                        };
-                        let mut model_status =
-                            backend.model_status.write().expect("model_status write");
-                        let backend_model_names: HashSet<String> =
-                            backend_models.iter().map(|m| m.name.clone()).collect();
-
-                        for configured_model in &backend.configured_models {
-                            let config_base = configured_model
-                                .split(':')
-                                .next()
-                                .unwrap_or(configured_model);
-                            let was_available =
-                                model_status.get(configured_model).copied().unwrap_or(true);
-
-                            // Check if backend has any model with matching base name
-                            let is_available = backend_model_names.iter().any(|backend_model| {
-                                let backend_base =
-                                    backend_model.split(':').next().unwrap_or(backend_model);
-                                backend_base == config_base
-                            });
-
-                            if was_available && !is_available {
-                                warn!(
-                                    "Backend {} no longer has model {} available (but is configured)",
-                                    url, configured_model
-                                );
-                            } else if !was_available && is_available {
-                                info!(
-                                    "Backend {} now has model {} available",
-                                    url, configured_model
-                                );
-                            }
-
-                            model_status.insert(configured_model.clone(), is_available);
-                        }
+                    // The scheduler only re-evaluates queued tasks when woken.
+                    // Without this, tasks queued while a backend was down would
+                    // sit there until an unrelated request arrived or finished.
+                    if apply_probe_result(state, &url, &result) {
+                        state.notify.notify_one();
                     }
-                    Err(reason) => {
-                        let mut backends = state.backends.lock().lock_unwrap("backends");
-                        let Some(backend) = backends.iter_mut().find(|b| b.url == url) else {
-                            // Removed from the config while we were probing.
-                            continue;
+
+                    {
+                        let mut lists = lists.lock().lock_unwrap("health lists");
+                        match result {
+                            Ok(models) => lists.insert(url.clone(), models),
+                            Err(_) => lists.remove(&url),
                         };
-
-                        if backend.is_online {
-                            match reason {
-                                FetchError::Unreachable => {
-                                    info!("Backend {} went offline", url)
-                                }
-                                FetchError::NoUsableList(failures) => warn!(
-                                    "Backend {} responded but served no model list on {} — marking offline ({})",
-                                    url,
-                                    MODEL_LIST_ENDPOINTS.join(" or "),
-                                    failures.join("; ")
-                                ),
-                            }
-                            backend.is_online = false;
-                        }
-
-                        // Mark all configured models as unavailable
-                        let mut model_status =
-                            backend.model_status.write().expect("model_status write");
-                        for model_name in &backend.configured_models {
-                            model_status.insert(model_name.clone(), false);
-                        }
+                        build_tags_cache(state, &lists);
                     }
+
+                    (url, preferred)
                 }
+            });
+
+            for (url, preferred) in futures_util::future::join_all(probes).await {
+                endpoints.insert(url, preferred);
             }
 
-            // Build merged cache after checking all backends
-            let _ = build_tags_cache(&state, &state.client, &mut endpoints).await;
+            // Also covers a cycle without any backend (cache becomes empty).
+            build_tags_cache(&state, &lists.lock().lock_unwrap("health lists"));
 
             tokio::time::sleep(std::time::Duration::from_secs(state.health_check_interval)).await;
         }
@@ -737,17 +769,27 @@ mod list_tests {
     }
 
     #[test]
-    fn base_name_matching_covers_slashed_model_names() {
-        let configured = "unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M";
+    fn availability_matches_slashed_model_names() {
         let models = parse(llamacpp_v1_models());
+        assert!(backend_has_model(
+            &models,
+            "unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M"
+        ));
+    }
 
-        let config_base = configured.split(':').next().unwrap();
-        let is_available = models.iter().any(|m| {
-            let backend_base = m.name.split(':').next().unwrap_or(&m.name);
-            backend_base == config_base
-        });
+    #[test]
+    fn availability_requires_the_same_tag() {
+        let models = parse(serde_json::json!({
+            "models": [{ "name": "qwen3:4b" }, { "name": "plain:latest" }]
+        }));
 
-        assert!(is_available);
+        // Regression: only the part before the colon used to be compared.
+        assert!(!backend_has_model(&models, "qwen3:35b"));
+        assert!(!backend_has_model(&models, "qwen3"));
+        assert!(backend_has_model(&models, "qwen3:4b"));
+        // A missing tag still means `:latest`, on either side.
+        assert!(backend_has_model(&models, "plain"));
+        assert!(backend_has_model(&models, "plain:latest"));
     }
 }
 

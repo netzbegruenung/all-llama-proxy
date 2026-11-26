@@ -61,6 +61,7 @@ Go to the [releases section](https://github.com/netzbegruenung/all-llama-proxy/r
 - `-t, --timeout <SECONDS>`: Backend idle timeout in seconds (default: `300`). A request fails when the backend sends nothing for this long, including while waiting for the first byte; a response that keeps streaming is not cut off.
 - `--allow-all-routes`: Enable fallback proxy for non-standard endpoints
 - `-i, --ip-header`: trusted source IP header, useful behind proxy for TLS offloading. Make sure that you do not trust headers that you do not control.
+- `--ip-header-trusted-hops <N>`: number of your own reverse proxies that append to `--ip-header` (default: `1`). The client IP is read N entries from the right of the header, because everything further left is supplied by the client and can be forged. If the header has fewer entries than N, the socket address is used.
 - `-h, --help`: Print help message
 - `-V, --version`: Print version information
 - `--debug`: print debug messages to log file

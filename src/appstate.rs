@@ -484,6 +484,9 @@ pub struct AppState {
     pub log_buffer: LogBuffer,
     /// HTTP header to extract real client IP from
     pub ip_header: Option<String>,
+    /// Number of trusted reverse proxies that append to `ip_header`. The
+    /// client IP is the entry this many positions from the right.
+    pub ip_header_trusted_hops: usize,
     /// Cached /api/tags response with merged models
     pub cached_tags: Arc<RwLock<Option<CachedTags>>>,
     /// Health check interval in seconds
@@ -572,6 +575,7 @@ impl AppState {
             debug,
             log_buffer,
             ip_header,
+            ip_header_trusted_hops: 1,
             cached_tags: Arc::new(RwLock::new(None)),
             health_check_interval,
         })
@@ -634,6 +638,10 @@ impl AppState {
             backends.sort_by(|a, b| a.url.cmp(&b.url));
         }
 
+        // Queued tasks may be routable now (new model, alias or backend), and
+        // the scheduler only re-evaluates them when woken.
+        self.notify.notify_one();
+
         Ok(())
     }
 
@@ -683,8 +691,12 @@ impl AppState {
     #[allow(clippy::collapsible_if)]
     fn load_blocked_items() -> (HashSet<IpAddr>, HashSet<String>) {
         if let Ok(content) = fs::read_to_string(BLOCKED_FILE) {
-            if let Ok(config) = serde_json::from_str::<BlockedConfig>(&content) {
-                return (config.ips, config.users);
+            match serde_json::from_str::<BlockedConfig>(&content) {
+                Ok(config) => return (config.ips, config.users),
+                Err(e) => warn!(
+                    "Ignoring unreadable {}: {} - starting with nothing blocked",
+                    BLOCKED_FILE, e
+                ),
             }
         }
         (HashSet::new(), HashSet::new())
@@ -699,27 +711,74 @@ impl AppState {
                 .lock_unwrap("blocked_users")
                 .clone(),
         };
-        if let Ok(content) = serde_json::to_string_pretty(&config) {
-            let _ = fs::write(BLOCKED_FILE, content);
+        let content = match serde_json::to_string_pretty(&config) {
+            Ok(content) => content,
+            Err(e) => {
+                warn!("Could not serialize blocked items: {}", e);
+                return;
+            }
+        };
+
+        // Write to a temp file and rename, so a crash mid-write cannot leave a
+        // truncated file that would silently load as "nothing blocked".
+        let tmp = format!("{}.tmp", BLOCKED_FILE);
+        if let Err(e) = fs::write(&tmp, content).and_then(|_| fs::rename(&tmp, BLOCKED_FILE)) {
+            let cwd = std::env::current_dir()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "?".to_string());
+            warn!(
+                "Could not persist blocked items to {} in {}: {} - blocks will be lost on restart",
+                BLOCKED_FILE, cwd, e
+            );
         }
     }
 
     pub fn block_ip(&self, ip: IpAddr) {
-        {
-            let mut ips = self.blocked_ips.lock().lock_unwrap("blocked_ips");
-            ips.insert(ip);
+        let changed = self
+            .blocked_ips
+            .lock()
+            .lock_unwrap("blocked_ips")
+            .insert(ip);
+        if changed {
+            self.save_blocked_items();
+            warn!("IP blocked: {}", ip);
         }
-        self.save_blocked_items();
-        warn!("IP blocked: {}", ip);
+    }
+
+    pub fn unblock_ip(&self, ip: &IpAddr) {
+        let changed = self
+            .blocked_ips
+            .lock()
+            .lock_unwrap("blocked_ips")
+            .remove(ip);
+        if changed {
+            self.save_blocked_items();
+            info!("IP unblocked: {}", ip);
+        }
     }
 
     pub fn block_user(&self, user_id: String) {
-        {
-            let mut users = self.blocked_users.lock().lock_unwrap("blocked_users");
-            users.insert(user_id.clone());
+        let changed = self
+            .blocked_users
+            .lock()
+            .lock_unwrap("blocked_users")
+            .insert(user_id.clone());
+        if changed {
+            self.save_blocked_items();
+            warn!("User blocked: {}", user_id);
         }
-        self.save_blocked_items();
-        warn!("User blocked: {}", user_id);
+    }
+
+    pub fn unblock_user(&self, user_id: &str) {
+        let changed = self
+            .blocked_users
+            .lock()
+            .lock_unwrap("blocked_users")
+            .remove(user_id);
+        if changed {
+            self.save_blocked_items();
+            info!("User unblocked: {}", user_id);
+        }
     }
 
     pub fn is_ip_blocked(&self, ip: &IpAddr) -> bool {

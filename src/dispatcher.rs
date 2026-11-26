@@ -52,17 +52,38 @@ fn format_duration_short(d: std::time::Duration) -> String {
     }
 }
 
-/// Extract client IP from headers or fallback to connection address
-fn extract_client_ip(headers: &HeaderMap, addr: SocketAddr, ip_header: &Option<String>) -> IpAddr {
-    if let Some(header_name) = ip_header {
-        headers
-            .get(header_name)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.split(',').next().and_then(|ip| ip.trim().parse().ok()))
-            .unwrap_or_else(|| addr.ip())
-    } else {
-        addr.ip()
-    }
+/// Extract client IP from headers or fallback to connection address.
+///
+/// Forwarding headers such as `X-Forwarded-For` are appended to by each proxy,
+/// so everything left of the entries written by our own proxies is supplied by
+/// the client and can be forged. The client IP is therefore taken
+/// `trusted_hops` entries from the *right* (1 = the address our reverse proxy
+/// saw). Taking the leftmost entry would let a client pick its own IP and
+/// dodge IP blocks or frame another address.
+fn extract_client_ip(
+    headers: &HeaderMap,
+    addr: SocketAddr,
+    ip_header: &Option<String>,
+    trusted_hops: usize,
+) -> IpAddr {
+    let Some(header_name) = ip_header else {
+        return addr.ip();
+    };
+
+    // A header may be sent on several lines; together they form one list.
+    let entries: Vec<&str> = headers
+        .get_all(header_name)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|s| s.split(','))
+        .map(str::trim)
+        .collect();
+
+    entries
+        .len()
+        .checked_sub(trusted_hops.max(1))
+        .and_then(|i| entries[i].parse().ok())
+        .unwrap_or_else(|| addr.ip())
 }
 
 /// Authenticate request and return user ID if successful
@@ -935,7 +956,12 @@ pub async fn proxy_handler(
     body: Body,
 ) -> impl IntoResponse {
     let path = uri.path().to_string();
-    let ip = extract_client_ip(&headers, addr, &state.ip_header);
+    let ip = extract_client_ip(
+        &headers,
+        addr,
+        &state.ip_header,
+        state.ip_header_trusted_hops,
+    );
     let is_debug = state.debug;
 
     // --- Authentication ---
@@ -1087,7 +1113,12 @@ fn authorize_metadata_request(
     kind: &str,
     openai_style: bool,
 ) -> Result<String, axum::response::Response> {
-    let ip = extract_client_ip(headers, addr, &state.ip_header);
+    let ip = extract_client_ip(
+        headers,
+        addr,
+        &state.ip_header,
+        state.ip_header_trusted_hops,
+    );
 
     let deny = |status: StatusCode, code: &str, message: &str| {
         if openai_style {
@@ -1221,6 +1252,7 @@ mod tests {
             debug: false,
             log_buffer: log_buffer.clone(),
             ip_header: None,
+            ip_header_trusted_hops: 1,
             cached_tags: Arc::new(RwLock::new(None)),
             health_check_interval: 10,
         })
@@ -1584,6 +1616,39 @@ mod tests {
             }
             _ => panic!("expected dispatch"),
         }
+    }
+
+    #[test]
+    fn test_client_ip_is_taken_from_the_right() {
+        let addr: SocketAddr = "10.0.0.1:1234".parse().unwrap();
+        let name = Some("x-forwarded-for".to_string());
+        let ip = |values: &[&str], hops: usize| {
+            let mut headers = HeaderMap::new();
+            for v in values {
+                headers.append("x-forwarded-for", v.parse().unwrap());
+            }
+            extract_client_ip(&headers, addr, &name, hops).to_string()
+        };
+
+        // Single value (also the X-Real-IP case).
+        assert_eq!(ip(&["203.0.113.7"], 1), "203.0.113.7");
+        // Regression: the client-supplied leftmost entry must not win.
+        assert_eq!(ip(&["6.6.6.6, 203.0.113.7"], 1), "203.0.113.7");
+        // The list may be split across header lines.
+        assert_eq!(ip(&["6.6.6.6", "203.0.113.7"], 1), "203.0.113.7");
+        // Two trusted proxies: skip the inner proxy's entry.
+        assert_eq!(ip(&["6.6.6.6, 203.0.113.7, 10.0.0.2"], 2), "203.0.113.7");
+        // Fewer entries than trusted hops, garbage or no header: socket address.
+        assert_eq!(ip(&["203.0.113.7"], 2), "10.0.0.1");
+        assert_eq!(ip(&["not-an-ip"], 1), "10.0.0.1");
+        assert_eq!(ip(&[], 1), "10.0.0.1");
+        // Header not configured: never read it.
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "6.6.6.6".parse().unwrap());
+        assert_eq!(
+            extract_client_ip(&headers, addr, &None, 1).to_string(),
+            "10.0.0.1"
+        );
     }
 
     #[test]

@@ -44,13 +44,9 @@ impl DashboardServer {
                 let _ = std::fs::remove_file(&socket_path);
                 let listener = tokio::net::UnixListener::bind(&socket_path)?;
                 info!("Dashboard listening on {}", socket_path.display());
-
-                let socket_path = socket_path.clone();
-                tokio::spawn(async move {
-                    tokio::signal::ctrl_c().await.ok();
-                    let _ = std::fs::remove_file(&socket_path);
-                });
-
+                // The socket file is removed by main() on shutdown. Do not
+                // listen for Ctrl+C here: registering a SIGINT listener
+                // replaces the default "terminate" behaviour for the process.
                 listener
             }
             ServeMode::Activated(listener) => {
@@ -103,7 +99,12 @@ impl DashboardServer {
         loop {
             itv.tick().await;
             if let Ok(snapshot) = Self::capture_snapshot(&state) {
-                let _ = tx.send(snapshot).await;
+                // The receiver is dropped when the client's writer task ends.
+                // Stop then, or this loop would keep taking every state lock
+                // ten times a second for the rest of the process lifetime.
+                if tx.send(snapshot).await.is_err() {
+                    break;
+                }
             }
         }
     }
@@ -244,38 +245,18 @@ impl DashboardServer {
                     info!("VIP granted: {}", user_id);
                 }
             }
-            DashboardCmd::BlockUser(user_id) => {
-                let mut blocked_users = state.blocked_users.lock().lock_unwrap("blocked_users");
-                if blocked_users.insert(user_id.clone()) {
-                    info!("User blocked: {}", user_id);
-                }
-            }
-            DashboardCmd::UnblockUser(user_id) => {
-                let mut blocked_users = state.blocked_users.lock().lock_unwrap("blocked_users");
-                if blocked_users.remove(&user_id) {
-                    info!("User unblocked: {}", user_id);
-                }
-            }
-            DashboardCmd::BlockIp(ip_str) => {
-                if let Ok(ip) = ip_str.parse::<std::net::IpAddr>() {
-                    let mut blocked_ips = state.blocked_ips.lock().lock_unwrap("blocked_ips");
-                    if blocked_ips.insert(ip) {
-                        info!("IP blocked: {}", ip_str);
-                    }
-                } else {
-                    warn!("Invalid IP address to block: {}", ip_str);
-                }
-            }
-            DashboardCmd::UnblockIp(ip_str) => {
-                if let Ok(ip) = ip_str.parse::<std::net::IpAddr>() {
-                    let mut blocked_ips = state.blocked_ips.lock().lock_unwrap("blocked_ips");
-                    if blocked_ips.remove(&ip) {
-                        info!("IP unblocked: {}", ip_str);
-                    }
-                } else {
-                    warn!("Invalid IP address to unblock: {}", ip_str);
-                }
-            }
+            // Block changes go through AppState so they are written to
+            // blocked_items.json and survive a restart.
+            DashboardCmd::BlockUser(user_id) => state.block_user(user_id),
+            DashboardCmd::UnblockUser(user_id) => state.unblock_user(&user_id),
+            DashboardCmd::BlockIp(ip_str) => match ip_str.parse::<std::net::IpAddr>() {
+                Ok(ip) => state.block_ip(ip),
+                Err(_) => warn!("Invalid IP address to block: {}", ip_str),
+            },
+            DashboardCmd::UnblockIp(ip_str) => match ip_str.parse::<std::net::IpAddr>() {
+                Ok(ip) => state.unblock_ip(&ip),
+                Err(_) => warn!("Invalid IP address to unblock: {}", ip_str),
+            },
         }
     }
 }

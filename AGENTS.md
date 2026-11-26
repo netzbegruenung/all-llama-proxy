@@ -43,7 +43,7 @@ Client → axum routes (main.rs:153) → proxy_handler (dispatcher.rs:1349)
 
 **SIGHUP (main.rs:118):** reloads both `users.yaml` and `models.yaml` at runtime, then triggers immediate keep-alive for all models with `keep_alive: true`.
 
-**Blocked items** persist to `blocked_items.json` at the process working directory (dispatcher.rs:23).
+**Blocked items** persist to `blocked_items.json` in the process working directory (`BLOCKED_FILE`, appstate.rs). All block/unblock changes must go through `AppState::{block,unblock}_{user,ip}`, which save the file; never mutate `blocked_users`/`blocked_ips` directly. The working directory must be writable (the example unit sets `StateDirectory`/`WorkingDirectory`); a failed write is logged as a warning.
 
 **Model keep-alive:** Runs every 15 minutes, on startup, and after SIGHUP reloads. Models can disable keep-alive by setting `keep_alive: false` in models.yaml (useful for embedding models). (dispatcher.rs:1341)
 
@@ -88,7 +88,10 @@ Example systemd files in `examples/all-llama-proxy.service` and `examples/all-ll
 
 - **Edition 2024** (Cargo.toml:4)
 - Built on `tokio` + `axum` + `ratatui` + `crossterm`
-- Health checker queries `/api/tags` every 10s per backend (dispatcher.rs:1054)
+- Health checker (`spawn_health_checker`, health.rs) probes all backends concurrently every 10s with its own short-timeout client (5s connect / 10s per request) and applies each result as soon as that probe returns; it wakes the scheduler (`state.notify`) when a backend or model becomes available, as does a SIGHUP reload. The tags cache is built from those same lists (first backend in config order that reports the model)
+- Model availability and the tags cache compare full names via `model_names_match` (only a missing tag equals `:latest`); `qwen3:4b` on a backend does not satisfy configured `qwen3:35b`
+- `--ip-header` is read `--ip-header-trusted-hops` entries from the right (default 1), never the leftmost entry
+- SIGINT/SIGTERM are handled in `main` (`shutdown_signal`), which also removes a self-created dashboard socket; do not register signal listeners elsewhere
 - Model aliases are resolved in-body before dispatch (dispatcher.rs:696) — the `model` JSON field is rewritten to the real name
 - `normalize_model_tag` (dispatcher.rs:751) appends `:latest` if no tag present
 - Max body limit: 1 GB (`MAX_BODY_BYTES`, dispatcher.rs), enforced inside `proxy_handler` **after** authentication — the handler takes the raw `Body` on purpose; do not switch it back to a `Bytes` extractor or add a body-buffering layer, or unauthenticated clients can make the proxy buffer 1 GB each
