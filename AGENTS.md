@@ -73,7 +73,10 @@ users:
   - token_hash: abc123...
     user_id: alice
     vip: true
+    admin: true  # default: false
 ```
+
+`admin: true` is required for the model-management endpoints (`ADMIN_PATHS` in dispatcher.rs: `/api/create`, `/api/copy`, `/api/delete`, `/api/pull`, `/api/push`, `/api/blobs/*`); everyone else gets 403.
 
 Generate token hash: `echo -n "token" | sha256sum`
 

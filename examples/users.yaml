@@ -3,6 +3,7 @@ users:
 - token_hash: 9d749074378df5b8cece6d36fd88e2cfc3a06d8bedee2cd9a0c410e95145c4c9
   user_id: alice
   vip: true
+  admin: true  # may call /api/pull, /api/delete, /api/create, /api/copy, /api/push, /api/blobs (default: false)
 
   # hash of 'changeme-bob'
 - token_hash: 7e1b7658b063919d77c1d7e6c6d94c300b31829b592d233b977ad2022272e87f

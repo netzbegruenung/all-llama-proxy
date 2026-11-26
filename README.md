@@ -91,6 +91,10 @@ To start the TUI, execute `all-llama-tui`.
      user_id: REPLACE_WITH_USER_ID
    ```
 
+   Add `admin: true` to an entry to allow the model-management endpoints
+   (`/api/create`, `/api/copy`, `/api/delete`, `/api/pull`, `/api/push`,
+   `/api/blobs/*`). Users without it receive `403` on those paths.
+
 ### API Proxying
 
 Point your LLM clients to the `all-llama-proxy` port (`11435`) and include the `X-User-ID` header.
