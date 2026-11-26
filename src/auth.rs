@@ -1,5 +1,6 @@
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use subtle::ConstantTimeEq;
 
 #[derive(Deserialize)]
@@ -8,6 +9,9 @@ struct UserEntry {
     user_id: String,
     #[serde(default)]
     vip: bool,
+    /// Allows the model-management endpoints (pull, delete, create, ...).
+    #[serde(default)]
+    admin: bool,
 }
 
 #[derive(Deserialize)]
@@ -23,6 +27,8 @@ struct UsersFile {
 pub struct UserRegistry {
     /// sha256_hex -> (user_id, is_vip)
     map: Vec<(String, String, bool)>,
+    /// user_ids allowed to call model-management endpoints
+    admins: HashSet<String>,
 }
 
 impl UserRegistry {
@@ -34,17 +40,31 @@ impl UserRegistry {
     pub fn load(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let content = std::fs::read_to_string(path)?;
         let parsed: UsersFile = serde_yaml::from_str(&content)?;
+        let admins = parsed
+            .users
+            .iter()
+            .filter(|e| e.admin)
+            .map(|e| e.user_id.clone())
+            .collect();
         let map = parsed
             .users
             .into_iter()
             .map(|e| (e.token_hash.to_lowercase(), e.user_id, e.vip))
             .collect();
-        Ok(Self { map })
+        Ok(Self { map, admins })
     }
 
     /// Return an empty registry (all requests will be rejected).
     pub fn empty() -> Self {
-        Self { map: vec![] }
+        Self {
+            map: vec![],
+            admins: HashSet::new(),
+        }
+    }
+
+    /// Whether `user_id` may call model-management endpoints.
+    pub fn is_admin(&self, user_id: &str) -> bool {
+        self.admins.contains(user_id)
     }
 
     /// Hash `raw_token` with SHA-256 and look it up in the registry using
@@ -94,6 +114,7 @@ mod tests {
                 .into_iter()
                 .map(|(h, u, v)| (h.to_lowercase(), u.to_string(), v))
                 .collect(),
+            admins: HashSet::new(),
         }
     }
 
@@ -163,6 +184,22 @@ mod tests {
         assert_eq!(vip.len(), 2);
         assert!(vip.contains(&"bob".to_string()));
         assert!(vip.contains(&"charlie".to_string()));
+    }
+
+    #[test]
+    fn admin_flag_defaults_to_false() {
+        let path = std::env::temp_dir().join(format!("alp-users-{}.yaml", std::process::id()));
+        std::fs::write(
+            &path,
+            "users:\n  - token_hash: aa\n    user_id: alice\n  - token_hash: bb\n    user_id: root\n    admin: true\n",
+        )
+        .unwrap();
+        let registry = UserRegistry::load(path.to_str().unwrap()).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert!(!registry.is_admin("alice"));
+        assert!(registry.is_admin("root"));
+        assert!(!registry.is_admin("nobody"));
     }
 
     #[test]

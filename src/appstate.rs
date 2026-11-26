@@ -19,6 +19,9 @@ use crate::utils::LockExt;
 
 const BLOCKED_FILE: &str = "blocked_items.json";
 
+/// How long to wait for a TCP/TLS connection to a backend.
+const BACKEND_CONNECT_TIMEOUT_SECS: u64 = 10;
+
 /// Log entry for the in-TUI log buffer
 pub struct LogEntry {
     pub level: String,
@@ -86,19 +89,50 @@ impl LogBufferWriter {
 
     fn parse_and_store(&mut self, line: &str) {
         // Parse format: "LEVEL: message" or extract level from line
-        let (level, message) = if line.starts_with("DEBUG") {
-            ("DEBUG", line[6..].trim())
-        } else if line.starts_with("INFO") {
-            ("INFO", line[5..].trim())
-        } else if line.starts_with("WARN") {
-            ("WARN", line[5..].trim())
-        } else if line.starts_with("ERROR") {
-            ("ERROR", line[6..].trim())
-        } else {
-            ("INFO", line)
-        };
+        // Only an exact "LEVEL: " prefix counts. Never slice by a fixed byte
+        // offset: log lines can contain client-controlled text, and an
+        // out-of-range or mid-character index would panic inside the logger.
+        let (level, message) = ["DEBUG", "INFO", "WARN", "ERROR"]
+            .into_iter()
+            .find_map(|level| {
+                line.strip_prefix(level)
+                    .and_then(|rest| rest.strip_prefix(": "))
+                    .map(|rest| (level, rest.trim()))
+            })
+            .unwrap_or(("INFO", line));
 
         self.buffer.append(level, message.to_string());
+    }
+}
+
+#[cfg(test)]
+mod log_writer_tests {
+    use super::*;
+
+    #[test]
+    fn hostile_lines_do_not_panic() {
+        let buffer = LogBuffer::new(10);
+        let mut writer = LogBufferWriter::new(buffer.clone());
+        // Bare level names and a multi-byte char right after one used to hit
+        // an out-of-range / mid-character slice.
+        for line in [
+            "INFO",
+            "WARN",
+            "DEBUG",
+            "ERROR",
+            "INFO\u{e9}",
+            "ERROR\u{20ac}x",
+        ] {
+            writer.parse_and_store(line);
+        }
+        writer.parse_and_store("WARN: real message");
+
+        let lines = buffer.get_last_n(10);
+        assert_eq!(lines.len(), 7);
+        assert_eq!(lines[0].0, "INFO");
+        assert_eq!(lines[0].2, "INFO");
+        assert_eq!(lines[6].0, "WARN");
+        assert_eq!(lines[6].2, "real message");
     }
 }
 
@@ -506,8 +540,14 @@ impl AppState {
             );
         }
 
+        // `timeout` is an idle timeout, not a deadline for the whole request:
+        // a total `.timeout()` would cut off every streamed generation that
+        // runs longer than it, however healthy the backend is. `read_timeout`
+        // restarts after each successful read, so it only fires when the
+        // backend stops sending (including while waiting for the headers).
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(timeout))
+            .connect_timeout(std::time::Duration::from_secs(BACKEND_CONNECT_TIMEOUT_SECS))
+            .read_timeout(std::time::Duration::from_secs(timeout))
             .build()
             .expect("Failed to create reqwest client");
 

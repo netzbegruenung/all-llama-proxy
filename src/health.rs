@@ -41,7 +41,18 @@ pub enum FetchError {
     /// No HTTP response at all — the backend is down.
     Unreachable,
     /// The backend responded, but neither endpoint produced a usable list.
-    NoUsableList,
+    /// Carries one reason per endpoint that answered.
+    NoUsableList(Vec<String>),
+}
+
+/// Shorten a response body for log output.
+fn body_snippet(body: &str) -> String {
+    const MAX: usize = 200;
+    let body = body.trim();
+    match body.char_indices().nth(MAX) {
+        Some((i, _)) => format!("{}…", &body[..i]),
+        None => body.to_string(),
+    }
 }
 
 /// Fetch a backend's model list, trying `/api/tags` then `/v1/models`.
@@ -65,6 +76,7 @@ pub async fn fetch_backend_models(
     );
 
     let mut reachable = false;
+    let mut failures: Vec<String> = Vec::new();
 
     for endpoint in order {
         let url = format!("{}{}", base_url, endpoint);
@@ -83,15 +95,35 @@ pub async fn fetch_backend_models(
         // The status check is what rejects llama.cpp's 404 error body: with both
         // list fields defaulting, it would otherwise parse as an empty list and
         // be indistinguishable from a backend that genuinely has no models.
+        let body = match resp.text().await {
+            Ok(body) => body,
+            Err(e) => {
+                debug!("Failed to read body from {}: {}", url, e);
+                failures.push(format!(
+                    "{} {}: failed to read body: {}",
+                    endpoint, status, e
+                ));
+                continue;
+            }
+        };
+
         if !status.is_success() {
             debug!("{} returned {}", url, status);
+            failures.push(format!("{} {}: {}", endpoint, status, body_snippet(&body)));
             continue;
         }
 
-        let list = match resp.json::<ModelsResponse>().await {
+        let list = match serde_json::from_str::<ModelsResponse>(&body) {
             Ok(list) => list,
             Err(e) => {
                 debug!("Failed to parse model list from {}: {}", url, e);
+                failures.push(format!(
+                    "{} {}: unparseable ({}): {}",
+                    endpoint,
+                    status,
+                    e,
+                    body_snippet(&body)
+                ));
                 continue;
             }
         };
@@ -123,7 +155,7 @@ pub async fn fetch_backend_models(
     *preferred = None;
 
     if reachable {
-        Err(FetchError::NoUsableList)
+        Err(FetchError::NoUsableList(failures))
     } else {
         Err(FetchError::Unreachable)
     }
@@ -272,16 +304,15 @@ pub fn spawn_health_checker(state: Arc<AppState>) {
         let _ = build_tags_cache(&state, &state.client, &mut endpoints).await;
 
         loop {
-            let backends_to_check: Vec<(usize, String)> = {
+            // Backends are tracked by URL, never by position: a SIGHUP reload
+            // can remove or re-sort them while a probe is awaiting.
+            let backends_to_check: Vec<String> = {
                 let backends = state.backends.lock().lock_unwrap("backends");
-                backends
-                    .iter()
-                    .enumerate()
-                    .map(|(i, b)| (i, b.url.clone()))
-                    .collect()
+                backends.iter().map(|b| b.url.clone()).collect()
             };
+            endpoints.retain(|known, _| backends_to_check.contains(known));
 
-            for (idx, url) in backends_to_check {
+            for url in backends_to_check {
                 let preferred = endpoints.entry(url.clone()).or_default();
 
                 match fetch_backend_models(&state.client, &url, preferred).await {
@@ -289,14 +320,14 @@ pub fn spawn_health_checker(state: Arc<AppState>) {
                         // Keep alive all configured models when backend comes back online
                         let backend = {
                             let mut backends = state.backends.lock().lock_unwrap("backends");
-                            let backend = &mut backends[idx];
 
-                            if !backend.is_online {
-                                info!("Backend {} is back online", url);
-                                backend.is_online = true;
-                                Some(backend.clone())
-                            } else {
-                                None
+                            match backends.iter_mut().find(|b| b.url == url) {
+                                Some(backend) if !backend.is_online => {
+                                    info!("Backend {} is back online", url);
+                                    backend.is_online = true;
+                                    Some(backend.clone())
+                                }
+                                _ => None,
                             }
                         };
 
@@ -306,7 +337,10 @@ pub fn spawn_health_checker(state: Arc<AppState>) {
 
                         // Update per-model status (use base-name matching)
                         let mut backends = state.backends.lock().lock_unwrap("backends");
-                        let backend = &mut backends[idx];
+                        let Some(backend) = backends.iter_mut().find(|b| b.url == url) else {
+                            // Removed from the config while we were probing.
+                            continue;
+                        };
                         let mut model_status =
                             backend.model_status.write().expect("model_status write");
                         let backend_model_names: HashSet<String> =
@@ -344,17 +378,21 @@ pub fn spawn_health_checker(state: Arc<AppState>) {
                     }
                     Err(reason) => {
                         let mut backends = state.backends.lock().lock_unwrap("backends");
-                        let backend = &mut backends[idx];
+                        let Some(backend) = backends.iter_mut().find(|b| b.url == url) else {
+                            // Removed from the config while we were probing.
+                            continue;
+                        };
 
                         if backend.is_online {
                             match reason {
                                 FetchError::Unreachable => {
                                     info!("Backend {} went offline", url)
                                 }
-                                FetchError::NoUsableList => warn!(
-                                    "Backend {} responded but served no model list on {} — marking offline",
+                                FetchError::NoUsableList(failures) => warn!(
+                                    "Backend {} responded but served no model list on {} — marking offline ({})",
                                     url,
-                                    MODEL_LIST_ENDPOINTS.join(" or ")
+                                    MODEL_LIST_ENDPOINTS.join(" or "),
+                                    failures.join("; ")
                                 ),
                             }
                             backend.is_online = false;
@@ -840,7 +878,7 @@ mod fetch_tests {
         let mut preferred = None;
 
         match fetch_backend_models(&client, &base, &mut preferred).await {
-            Err(FetchError::NoUsableList) => {}
+            Err(FetchError::NoUsableList(_)) => {}
             Err(FetchError::Unreachable) => panic!("backend answered, should not be Unreachable"),
             Ok(_) => panic!("404 bodies must not parse as a model list"),
         }
@@ -868,7 +906,7 @@ mod fetch_tests {
         .await
         {
             Err(FetchError::Unreachable) => {}
-            Err(FetchError::NoUsableList) => panic!("nothing answered, should be Unreachable"),
+            Err(FetchError::NoUsableList(_)) => panic!("nothing answered, should be Unreachable"),
             Ok(_) => panic!("closed port must not yield models"),
         }
     }

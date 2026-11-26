@@ -125,6 +125,28 @@ fn normalize_path(path: &str) -> &str {
     }
 }
 
+/// Largest request body the proxy buffers, enforced in [`proxy_handler`] after
+/// the caller has been authenticated.
+pub const MAX_BODY_BYTES: usize = 1024 * 1024 * 1024;
+
+/// Model-management endpoints. They change what is installed on a backend
+/// (delete, pull, overwrite, upload), so they require `admin: true` in
+/// users.yaml instead of being open to every token holder.
+const ADMIN_PATHS: &[&str] = &[
+    "/api/create",
+    "/api/copy",
+    "/api/delete",
+    "/api/pull",
+    "/api/push",
+    "/api/blobs/",
+];
+
+fn is_admin_path(path: &str) -> bool {
+    ADMIN_PATHS
+        .iter()
+        .any(|p| path == *p || (p.ends_with('/') && path.starts_with(p)))
+}
+
 /// Paths that carry a `model` field in their JSON body.
 const MODEL_PATHS: &[&str] = &[
     "/api/generate",
@@ -164,7 +186,7 @@ fn extract_and_resolve_model(
     let requested_model = v.get("model")?.as_str()?.to_string();
 
     if debug_enabled {
-        debug!("Requested model: {} on path {}", requested_model, path);
+        debug!("Requested model: {:?} on path {}", requested_model, path);
     }
 
     // Resolve alias to real model name
@@ -178,7 +200,7 @@ fn extract_and_resolve_model(
         None => {
             // Not in config at all - don't modify body, will 503 later
             if debug_enabled {
-                debug!("Model {} not found in config", requested_model);
+                debug!("Model {:?} not found in config", requested_model);
             }
             return Some(requested_model);
         }
@@ -296,7 +318,6 @@ enum SelectionResult {
 struct DispatchTaskArgs {
     user_id: String,
     task: Task,
-    backend_idx: usize,
     backend_url: String,
     state: Arc<AppState>,
     client: reqwest::Client,
@@ -306,7 +327,6 @@ fn dispatch_task(args: DispatchTaskArgs) {
     let DispatchTaskArgs {
         user_id,
         task,
-        backend_idx,
         backend_url,
         state,
         client,
@@ -387,6 +407,7 @@ fn dispatch_task(args: DispatchTaskArgs) {
                     {
                         let mut stream = response.bytes_stream();
                         let mut client_disconnected = false;
+                        let mut stream_error = false;
                         while let Some(chunk_res) = stream.next().await {
                             match chunk_res {
                                 Ok(chunk) => {
@@ -400,11 +421,39 @@ fn dispatch_task(args: DispatchTaskArgs) {
                                         break;
                                     }
                                 }
-                                Err(_) => break,
+                                Err(e) => {
+                                    // The backend died or stalled mid-response.
+                                    // Forward the error so the client connection
+                                    // is aborted instead of ending cleanly, which
+                                    // would pass a truncated body off as complete.
+                                    error!(
+                                        "Backend {} stream failed for user {}: {}",
+                                        backend_url, user_id, e
+                                    );
+                                    let _ = task.responder.send(ResponsePart::Error(e)).await;
+                                    stream_error = true;
+                                    break;
+                                }
                             }
                         }
 
-                        if !client_disconnected {
+                        if stream_error {
+                            let mut dropped =
+                                state.dropped_counts.lock().lock_unwrap("dropped_counts");
+                            *dropped.entry(user_id.clone()).or_insert(0) += 1;
+
+                            let model_info = task
+                                .resolved_model
+                                .as_ref()
+                                .map(|m| format!(" using {}", m))
+                                .unwrap_or_default();
+                            info!(
+                                "Request failed mid-stream for user {}{}, duration {}",
+                                user_id,
+                                model_info,
+                                format_duration_short(start.elapsed())
+                            );
+                        } else if !client_disconnected {
                             let mut counts = state
                                 .processed_counts
                                 .lock()
@@ -466,16 +515,21 @@ fn dispatch_task(args: DispatchTaskArgs) {
         }
 
         {
+            // Look the backend up by URL: a SIGHUP reload may have removed or
+            // re-sorted backends while this request was in flight, so a
+            // positional index captured at dispatch time can be out of range
+            // or point at a different backend by now.
             let mut backends = state.backends.lock().lock_unwrap("backends");
-            let backend = &mut backends[backend_idx];
-            backend.active_requests = backend.active_requests.saturating_sub(1);
-            if let Some(model) = task.resolved_model.as_ref() {
-                let count = backend.active_models.entry(model.clone()).or_insert(0);
-                *count = count.saturating_sub(1);
-            }
-            backend.processed_count += 1;
-            if let Some(model) = task.resolved_model.as_ref() {
-                *backend.processed_models.entry(model.clone()).or_insert(0) += 1;
+            if let Some(backend) = backends.iter_mut().find(|b| b.url == backend_url) {
+                backend.active_requests = backend.active_requests.saturating_sub(1);
+                if let Some(model) = task.resolved_model.as_ref() {
+                    let count = backend.active_models.entry(model.clone()).or_insert(0);
+                    *count = count.saturating_sub(1);
+                }
+                backend.processed_count += 1;
+                if let Some(model) = task.resolved_model.as_ref() {
+                    *backend.processed_models.entry(model.clone()).or_insert(0) += 1;
+                }
             }
         }
         state.backend_freed.notify_one();
@@ -483,7 +537,9 @@ fn dispatch_task(args: DispatchTaskArgs) {
 }
 
 async fn handle_model_not_found(task: Task, model_name: String) {
-    warn!("No backend has model '{}', returning 503", model_name);
+    // `{:?}` escapes control characters: the name is client-supplied and must
+    // not be able to inject extra log lines.
+    warn!("No backend has model {:?}, returning 503", model_name);
     let error_body = Bytes::from(
         serde_json::json!({"error": format!("Model '{}' not available on any backend", model_name)}).to_string()
     );
@@ -766,7 +822,7 @@ fn select_and_prepare_task(state: &Arc<AppState>, current_idx: &mut usize) -> Se
             TaskPick::Fail { model_name, .. } => {
                 if is_debug {
                     debug!(
-                        "No backend is configured for model '{}' (user {})",
+                        "No backend is configured for model {:?} (user {})",
                         model_name, user_id
                     );
                 }
@@ -801,6 +857,13 @@ fn select_and_prepare_task(state: &Arc<AppState>, current_idx: &mut usize) -> Se
 
                     task.resolved_model = Some(resolved);
                 }
+
+                // The concurrency slot taken below is keyed by `model` and is
+                // released via `task.resolved_model` when the request ends.
+                // Paths outside MODEL_PATHS skip the body rewrite above, so
+                // make sure the routed model is recorded for them too -
+                // otherwise the slot would leak forever.
+                task.resolved_model = Some(model.clone());
 
                 if is_debug {
                     debug!(
@@ -841,11 +904,10 @@ pub async fn run_worker(state: Arc<AppState>) {
             SelectionResult::ModelNotFound(task, model_name) => {
                 handle_model_not_found(task, model_name).await;
             }
-            SelectionResult::Dispatch(user_id, task, backend_idx, backend_url) => {
+            SelectionResult::Dispatch(user_id, task, _backend_idx, backend_url) => {
                 dispatch_task(DispatchTaskArgs {
                     user_id,
                     task,
-                    backend_idx,
                     backend_url,
                     state: state.clone(),
                     client: state.client.clone(),
@@ -867,7 +929,10 @@ pub async fn proxy_handler(
     method: Method,
     headers: HeaderMap,
     axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
-    body: Bytes,
+    // Deliberately the raw, unread body. Extracting `Bytes` here would buffer
+    // up to MAX_BODY_BYTES before the handler runs, i.e. before the token is
+    // checked, letting anyone who can reach the port exhaust memory.
+    body: Body,
 ) -> impl IntoResponse {
     let path = uri.path().to_string();
     let ip = extract_client_ip(&headers, addr, &state.ip_header);
@@ -881,12 +946,6 @@ pub async fn proxy_handler(
 
     if is_debug {
         debug!("Request from user: {} to {} {}", user_id, method, path);
-        #[allow(clippy::collapsible_if)]
-        if path.starts_with("/api/generate") || path.starts_with("/api/chat") {
-            if let Ok(body_str) = std::str::from_utf8(&body) {
-                debug!("Request body: {}", body_str);
-            }
-        }
     }
 
     if state.is_ip_blocked(&ip) {
@@ -899,9 +958,46 @@ pub async fn proxy_handler(
         return (StatusCode::FORBIDDEN, "User blocked").into_response();
     }
 
+    if is_admin_path(&path)
+        && !state
+            .user_registry
+            .lock()
+            .lock_unwrap("user_registry")
+            .is_admin(&user_id)
+    {
+        warn!(
+            "Rejected admin endpoint {} for non-admin user: {} (IP: {})",
+            path, user_id, ip
+        );
+        return (StatusCode::FORBIDDEN, "Admin privileges required").into_response();
+    }
+
     {
         let mut ips = state.user_ips.lock().lock_unwrap("user_ips");
         ips.insert(user_id.clone(), ip);
+    }
+
+    // Only now - authenticated, not blocked, authorized - read the body.
+    let body = match axum::body::to_bytes(body, MAX_BODY_BYTES).await {
+        Ok(body) => body,
+        Err(e) => {
+            warn!(
+                "Rejected request body from user {} (IP: {}): {}",
+                user_id, ip, e
+            );
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "Request body too large or unreadable",
+            )
+                .into_response();
+        }
+    };
+
+    #[allow(clippy::collapsible_if)]
+    if is_debug && (path.starts_with("/api/generate") || path.starts_with("/api/chat")) {
+        if let Ok(body_str) = std::str::from_utf8(&body) {
+            debug!("Request body: {}", body_str);
+        }
     }
 
     let (tx, rx) = mpsc::channel(32);
@@ -1451,6 +1547,66 @@ mod tests {
         );
         assert_eq!(state.queues.lock().lock_unwrap("queues")["alice"].len(), 1);
         assert_eq!(state.queues.lock().lock_unwrap("queues")["bob"].len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_non_model_path_records_routed_model() {
+        // Regression: a request on a path outside MODEL_PATHS that still
+        // carries a `model` body took a concurrency slot that was never
+        // released, because `resolved_model` stayed None.
+        let state = create_test_state();
+        *state.model_config.write().unwrap() = two_model_config();
+        state
+            .backends
+            .lock()
+            .lock_unwrap("backends")
+            .push(test_backend(&["busy:1b", "idle:1b"]));
+
+        let _rx = queue_task(&state, "alice", "idle:1b");
+        state
+            .queues
+            .lock()
+            .lock_unwrap("queues")
+            .get_mut("alice")
+            .unwrap()[0]
+            .path = "/api/version".to_string();
+
+        let mut idx = 0;
+        match select_and_prepare_task(&state, &mut idx) {
+            SelectionResult::Dispatch(_, task, backend_idx, _) => {
+                let backends = state.backends.lock().lock_unwrap("backends");
+                assert_eq!(backends[backend_idx].active_models["idle:1b"], 1);
+                assert_eq!(
+                    task.resolved_model.as_deref(),
+                    Some("idle:1b"),
+                    "slot key must be recorded so dispatch_task can release it"
+                );
+            }
+            _ => panic!("expected dispatch"),
+        }
+    }
+
+    #[test]
+    fn test_admin_paths() {
+        for p in [
+            "/api/delete",
+            "/api/pull",
+            "/api/push",
+            "/api/create",
+            "/api/copy",
+        ] {
+            assert!(is_admin_path(p), "{p}");
+        }
+        assert!(is_admin_path("/api/blobs/sha256:abc"));
+        for p in [
+            "/api/chat",
+            "/api/show",
+            "/v1/chat/completions",
+            "/api/ps",
+            "/",
+        ] {
+            assert!(!is_admin_path(p), "{p}");
+        }
     }
 
     #[test]
