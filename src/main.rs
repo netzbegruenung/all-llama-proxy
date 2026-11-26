@@ -39,6 +39,11 @@ struct Args {
 
     #[arg(short = 'i', long = "ip-header")]
     ip_header: Option<String>,
+
+    /// Number of trusted reverse proxies in front of this server that append
+    /// to --ip-header. The client IP is read this many entries from the right.
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..))]
+    ip_header_trusted_hops: u64,
 }
 
 struct SimpleFormatter;
@@ -109,23 +114,24 @@ async fn main() {
     };
 
     let log_buffer_clone = log_buffer.clone();
-    let state = Arc::new(
-        AppState::new(
-            args.model_config_path.clone(),
-            args.timeout,
-            registry,
-            args.debug,
-            log_buffer_clone,
-            args.ip_header,
-            10,
-        )
-        .unwrap_or_else(|e| {
-            eprintln!("ERROR: Failed to load model configuration");
-            eprintln!("Details: {}", e);
-            eprintln!("Check {} for correct YAML syntax", args.model_config_path);
-            std::process::exit(1);
-        }),
-    );
+    let ip_header_trusted_hops = args.ip_header_trusted_hops as usize;
+    let mut state = AppState::new(
+        args.model_config_path.clone(),
+        args.timeout,
+        registry,
+        args.debug,
+        log_buffer_clone,
+        args.ip_header,
+        10,
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("ERROR: Failed to load model configuration");
+        eprintln!("Details: {}", e);
+        eprintln!("Check {} for correct YAML syntax", args.model_config_path);
+        std::process::exit(1);
+    });
+    state.ip_header_trusted_hops = ip_header_trusted_hops;
+    let state = Arc::new(state);
 
     let sighup_state = state.clone();
     let users_path = args.users_path.clone();
@@ -216,6 +222,10 @@ async fn main() {
         });
     info!("Dispatcher running on http://{}", addr);
 
+    // Socket file we created ourselves and must remove on shutdown. A
+    // systemd-activated socket belongs to systemd and is left alone.
+    let mut owned_socket: Option<PathBuf> = None;
+
     if let Ok(Some(dashboard_server)) = DashboardServer::from_systemd() {
         let dashboard_state = state.clone();
         tokio::spawn(async move {
@@ -226,6 +236,7 @@ async fn main() {
         info!("Dashboard activated via systemd socket");
     } else {
         let socket_path_buf = PathBuf::from(&args.dashboard_socket);
+        owned_socket = Some(socket_path_buf.clone());
         let dashboard_state = state.clone();
         tokio::spawn(async move {
             let server = match DashboardServer::new(socket_path_buf) {
@@ -242,13 +253,44 @@ async fn main() {
         info!("Dashboard enabled at {}", args.dashboard_socket);
     }
 
-    axum::serve(
+    let server = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await
-    .unwrap_or_else(|e| {
+    );
+
+    // Stop on SIGINT (Ctrl+C) and SIGTERM alike. In-flight requests are
+    // dropped, as they were with the default signal disposition.
+    let result = tokio::select! {
+        result = server => result,
+        signal = shutdown_signal() => {
+            info!("Received {}, shutting down", signal);
+            Ok(())
+        }
+    };
+
+    if let Some(path) = owned_socket {
+        let _ = std::fs::remove_file(path);
+    }
+
+    if let Err(e) = result {
         eprintln!("ERROR: Server failed: {}", e);
         std::process::exit(1);
-    });
+    }
+}
+
+/// Resolves with the signal name once SIGINT or SIGTERM arrives.
+async fn shutdown_signal() -> &'static str {
+    let mut term = match signal(SignalKind::terminate()) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("Could not register SIGTERM handler: {}", e);
+            tokio::signal::ctrl_c().await.ok();
+            return "SIGINT";
+        }
+    };
+
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => "SIGINT",
+        _ = term.recv() => "SIGTERM",
+    }
 }

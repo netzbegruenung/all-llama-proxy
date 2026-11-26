@@ -3,10 +3,15 @@ Description=all-llama-proxy for load balancing requests to Ollama servers
 After=network.target
 
 [Service]
-Type=notify
+# The proxy does not send sd_notify readiness, so Type=notify would time out.
+Type=simple
 ExecStart=/usr/local/bin/all-llama-proxy
 User=www-data
 Group=www-data
+# blocked_items.json is written to the working directory; give the service a
+# writable one (/var/lib/all-llama-proxy), otherwise blocks do not survive a restart.
+StateDirectory=all-llama-proxy
+WorkingDirectory=/var/lib/all-llama-proxy
 Restart=on-failure
 RestartSec=10
 
